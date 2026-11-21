@@ -1008,6 +1008,12 @@ const RELEASE: bool = true;
 const NAMECP: bool = true;
 /// stage 1: ISO ts with an offset parsed with ingest_ts in the same SIMD pass as the Z form
 const ISOM: bool = true;
+/// MADV_WILLNEED on every input file at startup (serial; useless on the scorer's tmpfs)
+const WILLNEED: bool = false;
+/// stage-3 person table: initial capacity n / GTDIV slots (grows when half full)
+const GTDIV: usize = 4;
+/// stage-3 ts radix on (ts, index) keys only; gid and price fetched by index when placing
+const RADIXK: bool = false;
 /// stage-2 dedup table: one 16-slot bucket per DDIV records (rounded up to a power of two)
 const DDIV: usize = 8;
 /// stage 1: user hash and type check before the timestamps (shorter live ranges)
@@ -2070,7 +2076,7 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
     let nc: usize = cs.iter().map(|x| x.1).sum();
     let t3a = tsc();
     // group ids
-    let mut cap = (n / 4).next_power_of_two().max(1024);
+    let mut cap = (n / GTDIV).next_power_of_two().max(1024);
     gt.reset(cap);
     gids.clear();
     gids.reserve(n);
@@ -2206,6 +2212,30 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
                 a += x;
             }
         }
+        if RADIXK && !R3FIX {
+            // sort (ts << 32 | index) keys only (8 bytes a move); gid and price are fetched by index
+            // when placing
+            rtmp.clear();
+            rtmp.reserve(n);
+            rtmp.set_len(n);
+            let (mut sk, mut dk) = (rv2.as_mut_ptr(), rtmp.as_mut_ptr());
+            for i in 0..n {
+                *sk.add(i) = (*vals.get_unchecked(i) & 0xFFFF_FFFF_0000_0000) | i as u64;
+            }
+            for pass in 0..4usize {
+                let shift = 32 + 8 * pass as u32;
+                let h = &mut cnt[pass];
+                for i in 0..n {
+                    let v = *sk.add(i);
+                    let d = ((v >> shift) & 255) as usize;
+                    let o = *h.get_unchecked(d) as usize;
+                    *h.get_unchecked_mut(d) = o as u32 + 1;
+                    *dk.add(o) = v;
+                }
+                std::mem::swap(&mut sk, &mut dk);
+            }
+            // four passes: the sorted keys are back in rv2
+        } else {
         let (mut sv, mut sg) = (vals.as_mut_ptr(), gids.as_mut_ptr());
         let (mut dv, mut dg) = (rv2.as_mut_ptr(), rg2.as_mut_ptr());
         let p0 = if R3FIX { 1 } else { 0 };
@@ -2230,6 +2260,7 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
         }
         // four passes: the sorted data is back in vals/gids
         }
+        }
     }
     if PHASE_FINE {
         ph[7] += tsc() - tg1;
@@ -2238,11 +2269,22 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
     evs.clear();
     evs.reserve(n);
     evs.set_len(n);
+    if RADIX3 && RADIXK && !R3FIX && !R11 {
+        for i in 0..n {
+            let k = *rv2.get_unchecked(i);
+            let x = (k & 0xFFFF_FFFF) as usize;
+            let g = *gids.get_unchecked(x) as usize;
+            let o = eoff.get_unchecked_mut(g);
+            *evs.get_unchecked_mut(*o as usize) = (k & 0xFFFF_FFFF_0000_0000) | (*vals.get_unchecked(x) & 0xFFFF_FFFF);
+            *o += 1;
+        }
+    } else {
     for i in 0..n {
         let g = *gids.get_unchecked(i) as usize;
         let o = eoff.get_unchecked_mut(g);
         *evs.get_unchecked_mut(*o as usize) = *vals.get_unchecked(i);
         *o += 1;
+    }
     }
     // eoff[g] is now end of g == start of g+1; shift back
     for g in (1..=ng).rev() {
@@ -3576,7 +3618,9 @@ fn main() {
                 let f = std::fs::File::open(path).expect("open");
                 let p = unsafe { mmap(region.add(off), *size, PROT_READ, MAP_PRIVATE | MAP_FIXED | populate, f.as_raw_fd(), 0) };
                 assert!(p as isize != -1, "mmap file");
-                unsafe { madvise(p, *size, 3) }; // WILLNEED
+                if WILLNEED {
+                    unsafe { madvise(p, *size, 3) };
+                }
             }
             segs.push(FileSeg { start: off, end: off + size });
             off += size.div_ceil(pg) * pg + pg;
