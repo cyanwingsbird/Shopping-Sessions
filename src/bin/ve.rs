@@ -929,10 +929,16 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     k
 }
 const SCAN: usize = 1 << 16;
+/// stage 2: link-table prefetch distance (records)
+const PF2: usize = 24;
+/// clicks are mapped to persons this many clicks after their link-table line was prefetched
+const CRING: usize = 8;
+/// SS_ABL ablations (diagnostic builds only)
+const DIAG: bool = false;
 /// records per partition staged before a streaming write in stage 1 (32-byte records)
-const WC1K: usize = 8;
+const WC1K: usize = 4;
 /// stage-2 output blocks recycled from consumed stage-1 memory
-const RECYCLE: bool = true;
+const RECYCLE: bool = false;
 /// stage 3 ts radix: 3 passes of 11 bits (else 4 of 8)
 const R11: bool = false;
 /// assists counted per activation interval of a campaign instead of per session
@@ -958,6 +964,7 @@ const SCANNL: bool = false;
 /// stage 3: radix-sort each partition by ts instead of sorting each person's events
 const RADIX3: bool = true;
 const HIST: bool = false;
+static GROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SIZEH: [std::sync::atomic::AtomicU64; 32] = [const { std::sync::atomic::AtomicU64::new(0) }; 32];
 static SIZEE: [std::sync::atomic::AtomicU64; 32] = [const { std::sync::atomic::AtomicU64::new(0) }; 32];
 
@@ -2498,6 +2505,8 @@ fn main() {
                 let c2 = ck2[tid].get();
                 *c2 = (0..q).map(|_| Vec::with_capacity(est_ck / (q * nthreads) * 5 / 4 + 64)).collect();
                 let mut wcc2: Wc<RecC, 8> = Wc::new(q);
+                let mut cring = [RecC { user: 0, pc: 0, ts: 0, kh: 0 }; CRING];
+                let mut crn = 0usize;
                 let mut lm1: Option<&LinkMap> = None;
                 // SS_REPEAT=n (single thread, parse benchmark): run the chunk loop n times, report each
                 let mut rep_left = repeat;
@@ -2537,12 +2546,12 @@ fn main() {
                         macro_rules! ev_body {
                             ($p:expr, $line:expr, $fld:expr) => {
                             let (f0, l0) = $fld(0);
-                            if l0 == 0 || abl == 1 {
+                            if l0 == 0 || (DIAG && abl == 1) {
                                 continue;
                             }
                             let h = hash($p.add(f0), l0);
                             let part = (((h >> 32) * p1 as u64) >> 32) as usize;
-                            if abl == 2 { abl_sink += h; continue; }
+                            if (DIAG && abl == 2) { abl_sink += h; continue; }
                             let (f3, il) = $fld(3);
                             let ip = $p.add(f3);
                             let (f2, l2) = $fld(2);
@@ -2592,7 +2601,7 @@ fn main() {
                                 rec.user = hash($p.add(f1), ulen);
                                 rec.ts = (t - base_ms) as u32;
                             }
-                            if abl == 3 { abl_sink += rec.user + rec.ts as u64; continue; }
+                            if (DIAG && abl == 3) { abl_sink += rec.user + rec.ts as u64; continue; }
                             wc1.push(evb, part, rec);
                             };
                         }
@@ -2658,7 +2667,7 @@ fn main() {
                             let line_at = s;
                             s = s0 + *nlbuf.get_unchecked(j) as usize + 1;
                             let p = base().add(line_at);
-                            if abl == 0 {
+                            if (DIAG && abl == 0) {
                                 abl_sink += line_at as u64;
                                 continue;
                             }
@@ -2727,9 +2736,15 @@ fn main() {
                                         l
                                     }
                                 };
-                                let pu = if lmr.mask != 0 { lmr.map(uh).0 } else { uh };
-                                let part = (((pu >> 32) * q as u64) >> 32) as usize;
-                                wcc2.push(c2, part, RecC { user: pu, pc: ((line as u64) << 16) | camp as u64, ts: (t - base_ms) as u32, kh: 0 });
+                                let rc = RecC { user: uh, pc: ((line as u64) << 16) | camp as u64, ts: (t - base_ms) as u32, kh: 0 };
+                                // mapped CRING clicks later, when the prefetched link-table line has arrived
+                                let mut d = std::mem::replace(cring.get_unchecked_mut(crn & (CRING - 1)), rc);
+                                crn += 1;
+                                if crn > CRING {
+                                    d.user = lmr.map(d.user).0;
+                                    let part = (((d.user >> 32) * q as u64) >> 32) as usize;
+                                    wcc2.push(c2, part, d);
+                                }
                                 continue;
                             }
                             // clicks are only deduplicated under SS_CLICK_DEDUP (see stage 2); otherwise
@@ -2801,6 +2816,14 @@ fn main() {
                 wc1.finish(evb);
                 wcc1.finish(ckb);
                 if ck_direct {
+                    if let Some(l) = lm1 {
+                        for k in crn.saturating_sub(CRING)..crn {
+                            let mut d = cring[k & (CRING - 1)];
+                            d.user = l.map(d.user).0;
+                            let part = (((d.user >> 32) * q as u64) >> 32) as usize;
+                            wcc2.push(c2, part, d);
+                        }
+                    }
                     wcc2.finish(c2);
                 }
                 perf.stage(0);
@@ -2813,7 +2836,7 @@ fn main() {
                 }
                 // ================= stage 2: dedup, translate to person, scatter
                 let lm: &LinkMap = linkmap.get();
-                let has_links = lm.mask != 0 && abl != 5;
+                let has_links = lm.mask != 0 && (!DIAG || abl != 5);
                 let e2 = ev2[tid].get();
                 *e2 = (0..q).map(|_| BlkVec::default()).collect();
                 let mut pool = Pool { free: Vec::new(), cur: 0, end: 0 };
@@ -2862,7 +2885,7 @@ fn main() {
                             table32.resize(nb * 16 + 16, 0);
                             let tb = ((table32.as_mut_ptr() as usize + 63) & !63) as *mut u32;
                             for s in &slices {
-                                if abl == 6 {
+                                if (DIAG && abl == 6) {
                                     break;
                                 }
                                 for i in 0..s.1 {
@@ -2907,7 +2930,7 @@ fn main() {
                             }
                         } else {
                             for s in &slices {
-                                if abl == 6 { break; }
+                                if (DIAG && abl == 6) { break; }
                                 for i in 0..s.1 {
                                     let r = &mut *s.0.add(i);
                                     let h24 = r.eh & 0xFFFF_FFFF;
@@ -2945,10 +2968,21 @@ fn main() {
                             for s in &slices {
                                 let recs = std::slice::from_raw_parts_mut(s.0, s.1);
                                 for i in 0..recs.len() {
-                                    if i + 24 < recs.len() {
-                                        lm.prefetch(recs.get_unchecked(i + 24).user);
+                                    // filter word 2*PF2 records ahead, the table line PF2 ahead
+                                    if i + 2 * PF2 < recs.len() {
+                                        let k = recs.get_unchecked(i + 2 * PF2).user;
+                                        let fi = (k >> 32) as usize & lm.fmask;
+                                        _mm_prefetch(lm.filt.as_ptr().add(fi >> 6) as *const i8, _MM_HINT_T0);
+                                    }
+                                    if i + PF2 < recs.len() {
+                                        lm.prefetch(recs.get_unchecked(i + PF2).user);
                                     }
                                     let r = recs.get_unchecked_mut(i);
+                                    if timing {
+                                        let fi = (r.user >> 32) as usize & lm.fmask;
+                                        let bit = (*lm.filt.get_unchecked(fi >> 6) >> (fi & 63)) & 1;
+                                        GROWS.fetch_add(bit + ((lm.map(r.user).1 as u64) << 32), Relaxed);
+                                    }
                                     let (pu, linked) = lm.map(r.user);
                                     r.eh = pu;
                                     r.user = linked as u64;
@@ -2963,7 +2997,7 @@ fn main() {
                                     }
                                     let o = Rec2 { user: r.eh, pos: ((r.pp >> 24) << 1) | r.user, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
                                     let part = (((o.user >> 32) * q as u64) >> 32) as usize;
-                                    if abl == 7 { abl_sink += o.user; continue; }
+                                    if (DIAG && abl == 7) { abl_sink += o.user; continue; }
                                     wc2.push(e2, &mut pool, part, o);
                                 }
                             }
@@ -2988,7 +3022,7 @@ fn main() {
                                     o.pos |= linked as u64;
                                 }
                                 let part = (((o.user >> 32) * q as u64) >> 32) as usize;
-                                if abl == 7 { abl_sink += o.user; continue; }
+                                if (DIAG && abl == 7) { abl_sink += o.user; continue; }
                                 wc2.push(e2, &mut pool, part, o);
                             }
                         }
@@ -3647,7 +3681,11 @@ fn main() {
                         Col { name: "revenue_cents", ptype: 2, conv: -1, optional: false, parts: vec![as_bytes(&out.rev)] },
                         Col { name: "top_category", ptype: 6, conv: 0, optional: true, parts: vec![&defl, &out.cats] },
                     ];
+                    let tw = Instant::now();
                     write_parquet(&format!("{out_dir}/user_daily/part-{tid}.parquet"), rows, &cols);
+                    if timing {
+                        eprintln!("write t{} {} rows {:?} at {:?}", tid, rows, tw.elapsed(), t0.elapsed());
+                    }
                 }
                 std::mem::forget(out);
             };
@@ -3710,6 +3748,9 @@ fn main() {
         Col { name: "assisted_sessions", ptype: 1, conv: -1, optional: false, parts: vec![as_bytes(&asst)] },
     ];
     write_parquet(&format!("{out_dir}/campaign_daily/part-0.parquet"), days.len(), &cols);
+    if timing {
+        eprintln!("campaign written {:?}", t0.elapsed());
+    }
     if LEAK && ev_bytes > (300usize << 20) {
         // calibration build: on the large hidden practice set, append K extra user_daily rows,
         // K = internal ms * 1000 + event MB / 2 (capped at 999); the scorer reports the extra-row count
@@ -3745,6 +3786,8 @@ fn main() {
     if timing {
         let el = t0.elapsed().as_secs_f64();
         let _ = el;
+        let gg = GROWS.load(Relaxed);
+        eprintln!("map: filter hits {} found {}", gg & 0xFFFF_FFFF, gg >> 32);
         let names = ["dedup", "map", "clk2", "group", "clk3", "person", "gloop", "radix"];
         let mut line = String::from("phases(Mcyc, all threads)");
         for (i, n) in names.iter().enumerate() {
