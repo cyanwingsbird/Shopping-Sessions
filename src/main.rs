@@ -14,6 +14,8 @@ extern "C" {
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn _exit(code: i32) -> !;
     fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
+    fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+    fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
 }
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
@@ -929,6 +931,12 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     k
 }
 const SCAN: usize = 1 << 16;
+/// stage-3 grouping: hash-slot prefetch distance (0 = none)
+const PFG: usize = 0;
+/// stage-2 dedup: table bucket prefetch distance (0 = none)
+const PFD2: usize = 8;
+/// pin each thread to one of the allowed CPUs
+const PIN: bool = true;
 /// stage 2: link-table prefetch distance (records)
 const PF2: usize = 24;
 /// clicks are mapped to persons this many clicks after their link-table line was prefetched
@@ -2380,6 +2388,18 @@ fn main() {
     let next_p1 = AtomicUsize::new(0);
     let next_q = AtomicUsize::new(0);
     let barrier = Barrier::new(nthreads);
+    let cpus: Vec<usize> = {
+        let mut m = [0u64; 16];
+        let mut v = Vec::new();
+        if unsafe { sched_getaffinity(0, 128, m.as_mut_ptr()) } == 0 {
+            for c in 0..1024 {
+                if (m[c / 64] >> (c % 64)) & 1 != 0 {
+                    v.push(c);
+                }
+            }
+        }
+        if v.len() < nthreads { Vec::new() } else { v }
+    };
     // link files are parsed by all threads first (256 KB chunks), then one thread builds the map
     let mut lchunks: Vec<Chunk> = Vec::new();
     for sg in ln_segs.iter() {
@@ -2406,7 +2426,15 @@ fn main() {
             let (lchunks, next_lchunk, lraw) = (&lchunks, &next_lchunk, &lraw);
             let (camp_tab, ln_segs, out_dir) = (&camp_tab, &ln_segs, &out_dir);
             let (dims, build_prods) = (&dims, &build_prods);
+            let cpus = &cpus;
             let body = move || unsafe {
+                if PIN && !cpus.is_empty() {
+                    // one thread per allowed CPU, so the scheduler never moves (or stacks) them
+                    let c = cpus[tid % cpus.len()];
+                    let mut m = [0u64; 16];
+                    m[c / 64] |= 1 << (c % 64);
+                    sched_setaffinity(0, 128, m.as_ptr());
+                }
                 let mut perf = Perf::open(perf_on);
                 // ================= links: parsed by all threads, built by thread 0
                 if tid == 0 {
@@ -2889,6 +2917,10 @@ fn main() {
                                     break;
                                 }
                                 for i in 0..s.1 {
+                                    if PFD2 > 0 && i + PFD2 < s.1 {
+                                        let e2h = (*s.0.add(i + PFD2)).eh;
+                                        _mm_prefetch(tb.add((e2h as usize & bmask) * 16) as *const i8, _MM_HINT_T0);
+                                    }
                                     let r = &mut *s.0.add(i);
                                     let tag = ((r.eh >> 32) & 0xFFF) as u32;
                                     let t = _mm256_set1_epi32(tag as i32);
@@ -3185,7 +3217,13 @@ fn main() {
                         let bv = &ev2[t].get()[qi];
                         for (bi, &bp) in bv.blocks.iter().enumerate() {
                         let blen = if bi + 1 == bv.blocks.len() { bv.last } else { BLK };
-                        for r in std::slice::from_raw_parts(bp, blen).iter() {
+                        let rs = std::slice::from_raw_parts(bp, blen);
+                        for (ri, r) in rs.iter().enumerate() {
+                            if PFG > 0 && ri + PFG < rs.len() {
+                                let ki = rs.get_unchecked(ri + PFG).user as usize & gt.mask;
+                                _mm_prefetch(gt.keys.as_ptr().add(ki) as *const i8, _MM_HINT_T0);
+                                _mm_prefetch(gt.vals.as_ptr().add(ki) as *const i8, _MM_HINT_T0);
+                            }
                             let k = r.user;
                             let mut idx = k as usize & gt.mask;
                             let g = loop {
