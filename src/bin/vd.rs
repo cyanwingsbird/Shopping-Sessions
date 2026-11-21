@@ -264,12 +264,7 @@ unsafe fn hash(p: *const u8, len: usize) -> u64 {
         a = rd64(p.add(len - 16));
         b = rd64(p.add(len - 8));
     }
-    let h = if HASH1 && len <= 16 {
-        // one 64x64->128 multiply: a and b are masked ASCII, so neither operand can be zero
-        mum(a ^ S1, b ^ S0 ^ ((len as u64) << 59))
-    } else {
-        mum(mum(a ^ S1, b ^ seed) ^ (len as u64).wrapping_mul(S0), S0 ^ S1)
-    };
+    let h = mum(mum(a ^ S1, b ^ seed) ^ (len as u64).wrapping_mul(S0), S0 ^ S1);
     h | ((h == 0) as u64)
 }
 
@@ -832,18 +827,6 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     k
 }
 const SCAN: usize = 1 << 16;
-/// bit filter in front of the link table
-const LFILT: bool = false;
-/// records per partition staged before a streaming write in stage 2 (24-byte records: 4 or 8)
-const WC2K: usize = 8;
-/// event lines: prefetch this many bytes ahead (0 = rely on the hardware prefetcher)
-const PFD: usize = 0;
-/// all threads parse the link files before thread 0 builds the map
-const PLINKS: bool = true;
-/// ids of up to 16 bytes hashed with a single multiply
-const HASH1: bool = true;
-/// find line ends with a separate pass over each 64 KB block (else: from the splitter, line by line)
-const SCANNL: bool = false;
 /// stage 3: radix-sort each partition by ts instead of sorting each person's events
 const RADIX3: bool = true;
 const HIST: bool = false;
@@ -1231,7 +1214,7 @@ impl LinkMap {
     #[inline(always)]
     unsafe fn bucket_ptr(&self, k: u64) -> (*const LBucket, u64, usize) {
         let fi = (k >> 32) as usize & self.fmask;
-        let bit = if LFILT { (*self.filt.get_unchecked(fi >> 6) >> (fi & 63)) & 1 } else { 1 };
+        let bit = (*self.filt.get_unchecked(fi >> 6) >> (fi & 63)) & 1;
         let i = self.bucket(k);
         let p = if bit != 0 { self.slots.as_ptr().add(i) } else { &self.empty as *const LBucket };
         (p, bit, i)
@@ -2160,18 +2143,6 @@ fn main() {
     let next_p1 = AtomicUsize::new(0);
     let next_q = AtomicUsize::new(0);
     let barrier = Barrier::new(nthreads);
-    // link files are parsed by all threads first (256 KB chunks), then one thread builds the map
-    let mut lchunks: Vec<Chunk> = Vec::new();
-    for sg in ln_segs.iter() {
-        let mut a = sg.start;
-        while a < sg.end {
-            let b = (a + (256 << 10)).min(sg.end);
-            lchunks.push(Chunk { kind: 2, a, b, fs: sg.start, fe: sg.end });
-            a = b;
-        }
-    }
-    let next_lchunk = AtomicUsize::new(0);
-    let lraw: Vec<Sh<Vec<LinkRaw>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let _ = std::fs::create_dir_all(format!("{out_dir}/user_daily"));
     let _ = std::fs::create_dir_all(format!("{out_dir}/campaign_daily"));
     if timing {
@@ -2183,49 +2154,12 @@ fn main() {
             let (chunks, ev1, ck1, ev2, ck2, cells, linkmap, assists) = (&chunks, &ev1, &ck1, &ev2, &ck2, &cells, &linkmap, &assists);
             let (next_chunk, next_p1, next_q, barrier) = (&next_chunk, &next_p1, &next_q, &barrier);
             let links_ready = &links_ready;
-            let (lchunks, next_lchunk, lraw) = (&lchunks, &next_lchunk, &lraw);
             let (prod_tab, camp_tab, ln_segs, cat_names, cat_rank, out_dir) = (&prod_tab, &camp_tab, &ln_segs, &cat_names, &cat_rank, &out_dir);
             let body = move || unsafe {
                 let mut perf = Perf::open(perf_on);
-                // ================= links: parsed by all threads, built by thread 0
-                if PLINKS {
-                    let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
-                    let mine = lraw[tid].get();
-                    loop {
-                        let ci = next_lchunk.fetch_add(1, Relaxed);
-                        if ci >= lchunks.len() {
-                            break;
-                        }
-                        let c = lchunks[ci];
-                        // first line starting in [a, b); the file's first line is the header
-                        let mut s = if c.a == c.fs { c.a } else { c.a - 1 };
-                        while s < c.fe && *base().add(s) != b'\n' {
-                            s += 1;
-                        }
-                        s += 1;
-                        while s < c.b {
-                            let p = base().add(s);
-                            let (len, ok) = splitn::<2>(p, c.fe - s, &mut st, &mut en);
-                            if ok && en[0] > st[0] && en[1] > st[1] {
-                                let (la, lb) = ((en[0] - st[0]) as usize, (en[1] - st[1]) as usize);
-                                mine.push(LinkRaw {
-                                    ha: hash(p.add(st[0] as usize), la),
-                                    hb: hash(p.add(st[1] as usize), lb),
-                                    la: (((s + st[0] as usize) as u64) << 24) | la as u64,
-                                    lb: (((s + st[1] as usize) as u64) << 24) | lb as u64,
-                                });
-                            }
-                            s += len + 1;
-                        }
-                    }
-                    barrier.wait();
-                }
+                // ================= links (thread 0)
                 if tid == 0 {
-                    let mut raw: Vec<LinkRaw> = Vec::with_capacity((0..nthreads).map(|t| lraw[t].get().len()).sum());
-                    for t in 0..nthreads {
-                        raw.extend_from_slice(lraw[t].get());
-                    }
-                    if !PLINKS {
+                    let mut raw: Vec<LinkRaw> = Vec::new();
                     let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
                     for seg in ln_segs.iter() {
                         let mut s = seg.start;
@@ -2248,7 +2182,6 @@ fn main() {
                             }
                             s += len + 1;
                         }
-                    }
                     }
                     let tl = t0.elapsed();
                     *linkmap.get() = build_links(&raw);
@@ -2375,48 +2308,7 @@ fn main() {
                             wc1.push(evb, part, rec);
                             };
                         }
-                        if !SCANNL {
-                            // line by line: the splitter's line length gives the next line's start
-                            while s < c.b {
-                                let line_at = s;
-                                let p = base().add(line_at);
-                                if PFD > 0 {
-                                    _mm_prefetch(p.add(PFD) as *const i8, _MM_HINT_T0);
-                                }
-                                let sp = if strict { Sp7 { kind: 2, ..Default::default() } } else { split_ev7f(p, c.fe - line_at) };
-                                if sp.kind == 0 {
-                                    s = line_at + sp.len as usize + 1;
-                                    let fld = |k: usize| -> (usize, usize) { sp.field(k) };
-                                    ev_body!(p, line_at, fld);
-                                    continue;
-                                }
-                                if sp.kind == 1 {
-                                    s = line_at + sp.len as usize + 1;
-                                    continue;
-                                }
-                                let (l, ok) = if strict {
-                                    splitn::<7>(p, c.fe - line_at, &mut st, &mut en)
-                                } else {
-                                    let (l, r) = split_gen_full::<7>(p, c.fe - line_at, &mut st, &mut en);
-                                    if r == 2 {
-                                        for k in 0..7 {
-                                            let (a, b) = (st[k], en[k]);
-                                            let q = (a < b && *p.add(a as usize) == b'"') as u32;
-                                            st[k] = a + q;
-                                            en[k] = b - q;
-                                        }
-                                    }
-                                    (l, r != 0)
-                                };
-                                s = line_at + l + 1;
-                                if !ok {
-                                    continue;
-                                }
-                                let fld = |k: usize| -> (usize, usize) { (st[k] as usize, (en[k] - st[k]) as usize) };
-                                ev_body!(p, line_at, fld);
-                            }
-                        }
-                        'blocks: while SCANNL && s < c.b {
+                        'blocks: while s < c.b {
                         // line ends of the next SCAN bytes first, so that each line's parse does not wait
                         // on the previous line's newline search
                         let scan_end = (s + SCAN).min(c.fe);
@@ -2571,7 +2463,7 @@ fn main() {
                 *e2 = (0..q).map(|_| Vec::with_capacity(est_ev / (q * nthreads) * 5 / 4 + 64)).collect();
                 let mut table: Vec<u64> = Vec::new();
                 let mut table32: Vec<u32> = Vec::new();
-                let mut wc2: Wc<Rec2, WC2K> = Wc::new(q);
+                let mut wc2: Wc<Rec2, 8> = Wc::new(q);
                 let mut ph = [0u64; 8];
                 loop {
                     let pi = next_p1.fetch_add(1, Relaxed);
@@ -3033,20 +2925,6 @@ fn main() {
                                     sl(bp, bl).cmp(sl(ap, al))
                                 })
                             });
-                        }
-                        // names are read from the input lines: fetch them a few persons ahead
-                        if g + 8 < ng {
-                            let inf = *ginfo.get_unchecked(g + 8);
-                            if inf & 1 != 0 {
-                                let k = *gperson.get_unchecked(g + 8);
-                                _mm_prefetch(lm.names.as_ptr().add(k as usize & lm.nmask) as *const i8, _MM_HINT_T0);
-                            } else {
-                                _mm_prefetch(base().add((inf >> 1) as usize) as *const i8, _MM_HINT_T0);
-                            }
-                        }
-                        if g + 4 < ng && *ginfo.get_unchecked(g + 4) & 1 != 0 {
-                            let loc = lm.name(*gperson.get_unchecked(g + 4));
-                            _mm_prefetch(base().add((loc >> 24) as usize) as *const i8, _MM_HINT_T0);
                         }
                         // name
                         let info = ginfo[g];

@@ -832,6 +832,12 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     k
 }
 const SCAN: usize = 1 << 16;
+/// stage 2: link lookups and scatter in two passes over each partition
+const MAP2: bool = true;
+/// per-person sub-phases in the SS_TIMING report
+const PHASE_FINE: bool = false;
+/// stage 3: radix-sort each partition's clicks by ts instead of sorting each person's clicks
+const CKRADIX: bool = true;
 /// bit filter in front of the link table
 const LFILT: bool = true;
 /// records per partition staged before a streaming write in stage 2 (24-byte records: 4 or 8)
@@ -1282,6 +1288,20 @@ impl LinkMap {
     unsafe fn prefetch(&self, k: u64) {
         _mm_prefetch(self.bucket_ptr(k).0 as *const i8, _MM_HINT_T0);
     }
+}
+/// field 1 (user_id) of the event line at pos, quotes stripped; one 64-byte mask when it fits
+#[inline(always)]
+unsafe fn user_at(pos: u64) -> (*const u8, usize) {
+    let p = base().add(pos as usize);
+    let (_, c, _) = masks64(p);
+    let c1 = c & c.wrapping_sub(1);
+    if c1 == 0 {
+        return field_at(pos, 1);
+    }
+    let a = c.trailing_zeros() as usize + 1;
+    let b = c1.trailing_zeros() as usize;
+    let q = (b > a && *p.add(a) == b'"') as usize;
+    (p.add(a + q), b - a - 2 * q)
 }
 unsafe fn name_bytes<'a>(loc: u64) -> &'a [u8] {
     sl(base().add((loc >> 24) as usize), (loc & 0xFF_FFFF) as usize)
@@ -2691,7 +2711,38 @@ fn main() {
                         }
                         let tb = tsc();
                         ph[0] += tb - ta;
+                        if MAP2 && has_links {
+                            // persons first (link-table lookups only), then the scatter (write-combining
+                            // buffers only): the two working sets do not compete for the cache
+                            for s in &slices {
+                                let recs = std::slice::from_raw_parts_mut(s.0, s.1);
+                                for i in 0..recs.len() {
+                                    if i + 24 < recs.len() {
+                                        lm.prefetch(recs.get_unchecked(i + 24).user);
+                                    }
+                                    let r = recs.get_unchecked_mut(i);
+                                    let (pu, linked) = lm.map(r.user);
+                                    r.eh = pu;
+                                    r.user = linked as u64;
+                                }
+                            }
+                            for s in &slices {
+                                let recs = std::slice::from_raw_parts(s.0, s.1);
+                                for i in 0..recs.len() {
+                                    let r = recs.get_unchecked(i);
+                                    if r.ts >= 0x8000_0000 {
+                                        continue;
+                                    }
+                                    let o = Rec2 { user: r.eh, pos: ((r.pp >> 24) << 1) | r.user, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
+                                    let part = (((o.user >> 32) * q as u64) >> 32) as usize;
+                                    wc2.push(e2, part, o);
+                                }
+                            }
+                        }
                         for s in &slices {
+                            if MAP2 && has_links {
+                                break;
+                            }
                             let recs = std::slice::from_raw_parts(s.0, s.1);
                             for i in 0..recs.len() {
                                 if has_links && i + 24 < recs.len() {
@@ -2815,6 +2866,8 @@ fn main() {
                 let mut vals: Vec<u64> = Vec::new();
                 let mut cgids: Vec<u32> = Vec::new();
                 let mut ctmp: Vec<(u32, u32, u64)> = Vec::new();
+                let mut ctmp2: Vec<(u32, u32, u64)> = Vec::new();
+                let mut cg2: Vec<u32> = Vec::new();
                 let mut eoff: Vec<u32> = Vec::new();
                 let mut coff: Vec<u32> = Vec::new();
                 let mut ginfo: Vec<u64> = Vec::new(); // pos << 1 | linked ; and person
@@ -2993,6 +3046,48 @@ fn main() {
                             *x = acc;
                             acc += c;
                         }
+                        if CKRADIX && ncl > 1 {
+                            // order by ts first (LSD radix, 4 x 8 bits, stable), so that the stable placement
+                            // by person below leaves every person's clicks sorted by ts
+                            ctmp2.clear();
+                            ctmp2.reserve(ncl);
+                            ctmp2.set_len(ncl);
+                            cg2.clear();
+                            cg2.reserve(ncl);
+                            cg2.set_len(ncl);
+                            let mut cnt = [[0u32; 256]; 4];
+                            for i in 0..ncl {
+                                let t = ctmp.get_unchecked(i).0;
+                                cnt[0][(t & 255) as usize] += 1;
+                                cnt[1][((t >> 8) & 255) as usize] += 1;
+                                cnt[2][((t >> 16) & 255) as usize] += 1;
+                                cnt[3][(t >> 24) as usize] += 1;
+                            }
+                            for h in cnt.iter_mut() {
+                                let mut a = 0u32;
+                                for c in h.iter_mut() {
+                                    let x = *c;
+                                    *c = a;
+                                    a += x;
+                                }
+                            }
+                            let (mut sv, mut sg) = (ctmp.as_mut_ptr(), cgids.as_mut_ptr());
+                            let (mut dv, mut dg) = (ctmp2.as_mut_ptr(), cg2.as_mut_ptr());
+                            for pass in 0..4usize {
+                                let shift = 8 * pass as u32;
+                                let h = &mut cnt[pass];
+                                for i in 0..ncl {
+                                    let v = *sv.add(i);
+                                    let d = ((v.0 >> shift) & 255) as usize;
+                                    let o = *h.get_unchecked(d) as usize;
+                                    *h.get_unchecked_mut(d) = o as u32 + 1;
+                                    *dv.add(o) = v;
+                                    *dg.add(o) = *sg.add(i);
+                                }
+                                std::mem::swap(&mut sv, &mut dv);
+                                std::mem::swap(&mut sg, &mut dg);
+                            }
+                        }
                         cks.clear();
                         cks.resize(ncl, (0, 0, 0));
                         for i in 0..cgids.len() {
@@ -3024,8 +3119,9 @@ fn main() {
                             SIZEH[b.min(31)].fetch_add(1, Relaxed);
                             SIZEE[b.min(31)].fetch_add(ev.len() as u64, Relaxed);
                         }
+                        let tq0 = if PHASE_FINE { tsc() } else { 0 };
                         let ck = &mut cks[coff[g] as usize..coff[g + 1] as usize];
-                        if ck.len() > 1 {
+                        if !CKRADIX && ck.len() > 1 {
                             ck.sort_unstable_by(|a, b| {
                                 a.0.cmp(&b.0).then_with(|| {
                                     let (ap, al) = field_at(a.2, 0);
@@ -3034,6 +3130,8 @@ fn main() {
                                 })
                             });
                         }
+                        let tq1 = if PHASE_FINE { tsc() } else { 0 };
+                        ph[6] += tq1 - tq0;
                         // names are read from the input lines: fetch them a few persons ahead
                         if g + 8 < ng {
                             let inf = *ginfo.get_unchecked(g + 8);
@@ -3054,9 +3152,11 @@ fn main() {
                         if info & 1 != 0 {
                             name_buf.extend_from_slice(name_bytes(lm.name(gperson[g])));
                         } else {
-                            let (np, nl) = field_at(info >> 1, 1);
+                            let (np, nl) = user_at(info >> 1);
                             name_buf.extend_from_slice(sl(np, nl));
                         }
+                        let tq2 = if PHASE_FINE { tsc() } else { 0 };
+                        ph[7] += tq2 - tq1;
                         let n = ev.len();
                         let nck = ck.len();
                         let (mut lo, mut hi) = (0usize, 0usize);
@@ -3156,7 +3256,23 @@ fn main() {
                                     lo += 1;
                                 }
                                 if hi > lo {
-                                    camp = ck.get_unchecked(hi - 1).1 as usize;
+                                    let j = hi - 1;
+                                    camp = ck.get_unchecked(j).1 as usize;
+                                    if CKRADIX && j > lo && ck.get_unchecked(j - 1).0 == ck.get_unchecked(j).0 {
+                                        // clicks at the same ms: the smallest click_id
+                                        let t = ck.get_unchecked(j).0;
+                                        let mut best = j;
+                                        let mut k = j;
+                                        while k > lo && ck.get_unchecked(k - 1).0 == t {
+                                            k -= 1;
+                                            let (ap, al) = field_at(ck.get_unchecked(k).2, 0);
+                                            let (bp, bl) = field_at(ck.get_unchecked(best).2, 0);
+                                            if sl(ap, al) < sl(bp, bl) {
+                                                best = k;
+                                            }
+                                        }
+                                        camp = ck.get_unchecked(best).1 as usize;
+                                    }
                                 }
                                 for &a in &active {
                                     *asst_cells.get_unchecked_mut(a as usize * nd + day as usize) += 1;
@@ -3304,7 +3420,7 @@ fn main() {
     if timing {
         let el = t0.elapsed().as_secs_f64();
         let _ = el;
-        let names = ["dedup", "map", "clk2", "group", "clk3", "person"];
+        let names = ["dedup", "map", "clk2", "group", "clk3", "person", "cksort", "name"];
         let mut line = String::from("phases(Mcyc, all threads)");
         for (i, n) in names.iter().enumerate() {
             line.push_str(&format!(" {}={}", n, PHASE[i].load(Relaxed) / 1_000_000));
