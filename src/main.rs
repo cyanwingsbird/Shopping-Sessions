@@ -1027,6 +1027,8 @@ const WC2K: usize = 8;
 const PFD: usize = 0;
 /// all threads parse the link files before thread 0 builds the map
 const PLINKS: bool = true;
+/// links: ids interned in 256 hash partitions (each partition's table in L2), prefixes taken at parse time
+const LINKP: bool = true;
 /// ids of up to 16 bytes hashed with a single multiply
 const HASH1: bool = true;
 /// find line ends with a separate pass over each 64 KB block (else: from the splitter, line by line)
@@ -2765,6 +2767,8 @@ struct LinkRaw {
     hb: u64,
     la: u64,
     lb: u64,
+    pa: u64, // first 8 bytes, big-endian (prefix_of), read while the line is in cache
+    pb: u64,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -2890,74 +2894,106 @@ unsafe fn prefix_of(loc: u64) -> u64 {
         v & (!0u64 << (64 - 8 * len))
     }
 }
+/// Link ids interned partition by partition (256 partitions by bits 24..32 of the hash), so each
+/// partition's table stays in L2; ids are numbered in partition order. Returns each endpoint's id
+/// (2i: side a of link i, 2i + 1: side b).
+unsafe fn intern_part(raw: &[LinkRaw], hashes: &mut Vec<u64>, locs: &mut Vec<u64>, prefix: &mut Vec<u64>) -> Vec<u32> {
+    #[derive(Clone, Copy)]
+    struct Ep {
+        h: u64,
+        loc: u64,
+        pre: u64,
+        e: u64,
+    }
+    const PB: u32 = 8;
+    const NP: usize = 1 << PB;
+    let pof = |h: u64| ((h as u32) >> (32 - PB)) as usize;
+    let _ti = Instant::now();
+    let ne = raw.len() * 2;
+    let mut cnt = vec![0usize; NP + 1];
+    for l in raw.iter() {
+        *cnt.get_unchecked_mut(pof(l.ha) + 1) += 1;
+        *cnt.get_unchecked_mut(pof(l.hb) + 1) += 1;
+    }
+    for p in 0..NP {
+        cnt[p + 1] += cnt[p];
+    }
+    let mut eps: Vec<Ep> = Vec::with_capacity(ne);
+    eps.set_len(ne);
+    let mut pos = cnt.clone();
+    let ep = eps.as_mut_ptr();
+    for (i, l) in raw.iter().enumerate() {
+        let p = pof(l.ha);
+        *ep.add(*pos.get_unchecked(p)) = Ep { h: l.ha, loc: l.la, pre: l.pa, e: (2 * i) as u64 };
+        *pos.get_unchecked_mut(p) += 1;
+        let p = pof(l.hb);
+        *ep.add(*pos.get_unchecked(p)) = Ep { h: l.hb, loc: l.lb, pre: l.pb, e: (2 * i + 1) as u64 };
+        *pos.get_unchecked_mut(p) += 1;
+    }
+    let mut ids = vec![0u32; ne];
+    if std::env::var_os("SS_LMSTAT").is_some() {
+        eprintln!("scatter done {:?}", _ti.elapsed());
+    }
+    let maxp = (0..NP).map(|p| cnt[p + 1] - cnt[p]).max().unwrap_or(0);
+    let tcap = (maxp * 2).next_power_of_two().max(16);
+    let mut tk = vec![0u64; tcap];
+    let mut tv = vec![0u32; tcap];
+    for p in 0..NP {
+        let (a, b) = (cnt[p], cnt[p + 1]);
+        if a == b {
+            continue;
+        }
+        let cap = ((b - a) * 2).next_power_of_two().max(16);
+        let m = cap - 1;
+        tk[..cap].fill(0);
+        for k in a..b {
+            let x = *ep.add(k);
+            let mut j = x.h as usize & m;
+            let id = loop {
+                let kk = *tk.get_unchecked(j);
+                if kk == x.h {
+                    break *tv.get_unchecked(j);
+                }
+                if kk == 0 {
+                    let id = hashes.len() as u32;
+                    *tk.get_unchecked_mut(j) = x.h;
+                    *tv.get_unchecked_mut(j) = id;
+                    hashes.push(x.h);
+                    locs.push(x.loc);
+                    prefix.push(x.pre);
+                    break id;
+                }
+                j = (j + 1) & m;
+            };
+            *ids.get_unchecked_mut(x.e as usize) = id;
+        }
+    }
+    ids
+}
 unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
     if raw.is_empty() {
         return LinkMap { mask: 0, nb: 1, slots: vec![LB0], ovf: vec![0], names: vec![LSlot { key: 0, person: 0 }], nmask: 0, filt: vec![0], fmask: 0, empty: LB0 };
     }
     let tb0 = Instant::now();
-    let cap = (raw.len() * 2).next_power_of_two().max(16);
-    let mask = cap - 1;
-    let mut slots = vec![LSlot { key: 0, person: 0 }; cap];
     let mut hashes: Vec<u64> = Vec::with_capacity(raw.len() * 2);
     let mut locs: Vec<u64> = Vec::with_capacity(raw.len() * 2);
     let mut parent: Vec<u32> = Vec::with_capacity(raw.len() * 2);
-    let sp = slots.as_mut_ptr();
-    macro_rules! intern {
-        ($h:expr, $loc:expr) => {{
-            let h = $h;
-            let mut i = h as usize & mask;
-            loop {
-                let s = &mut *sp.add(i);
-                if s.key == h {
-                    break s.person as u32;
-                }
-                if s.key == 0 {
-                    let id = hashes.len() as u32;
-                    s.key = h;
-                    s.person = id as u64;
-                    hashes.push(h);
-                    locs.push($loc);
-                    parent.push(id);
-                    break id;
-                }
-                i = (i + 1) & mask;
-            }
-        }};
-    }
-    // ids first (table probes prefetched), then the unions (parent entries prefetched): the two
-    // kinds of random access do not wait on each other
-    let mut pairs: Vec<(u32, u32)> = Vec::new();
-    if LINK2 {
-        pairs.reserve(raw.len());
-        for (i, l) in raw.iter().enumerate() {
-            if i + 8 < raw.len() {
-                let n = raw.get_unchecked(i + 8);
-                _mm_prefetch(sp.add(n.ha as usize & mask) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(sp.add(n.hb as usize & mask) as *const i8, _MM_HINT_T0);
-            }
-            let a = intern!(l.ha, l.la);
-            let b = intern!(l.hb, l.lb);
-            pairs.push((a, b));
+    let mut prefix: Vec<u64> = Vec::new();
+    let linkp = LINKP && std::env::var_os("SS_LINKP").map_or(true, |v| v != "0");
+    if linkp {
+        prefix.reserve(raw.len() * 2);
+        let ids = intern_part(raw, &mut hashes, &mut locs, &mut prefix);
+        if std::env::var_os("SS_LMSTAT").is_some() {
+            eprintln!("intern_part {:?}", tb0.elapsed());
         }
-    }
-    let npairs = if LINK2 { pairs.len() } else { raw.len() };
-    for i in 0..npairs {
-        let (a, b) = if LINK2 {
-            if i + 16 < npairs {
-                let (na, nb) = *pairs.get_unchecked(i + 16);
-                _mm_prefetch(parent.as_ptr().add(na as usize) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(parent.as_ptr().add(nb as usize) as *const i8, _MM_HINT_T0);
+        parent.extend(0..hashes.len() as u32);
+        let np = raw.len();
+        for i in 0..np {
+            if i + 16 < np {
+                _mm_prefetch(parent.as_ptr().add(*ids.get_unchecked(2 * (i + 16)) as usize) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(parent.as_ptr().add(*ids.get_unchecked(2 * (i + 16) + 1) as usize) as *const i8, _MM_HINT_T0);
             }
-            *pairs.get_unchecked(i)
-        } else {
-            let l = raw.get_unchecked(i);
-            if i + 8 < raw.len() {
-                let n = raw.get_unchecked(i + 8);
-                _mm_prefetch(sp.add(n.ha as usize & mask) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(sp.add(n.hb as usize & mask) as *const i8, _MM_HINT_T0);
-            }
-            (intern!(l.ha, l.la), intern!(l.hb, l.lb))
-        };
+            let (a, b) = (*ids.get_unchecked(2 * i), *ids.get_unchecked(2 * i + 1));
         let pp = parent.as_mut_ptr();
         let mut ra = a;
         while *pp.add(ra as usize) != ra {
@@ -2978,6 +3014,89 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
                 *pp.add(ra as usize) = rb;
             }
         }
+        }
+    } else {
+        let cap = (raw.len() * 2).next_power_of_two().max(16);
+        let mask = cap - 1;
+        let mut slots = vec![LSlot { key: 0, person: 0 }; cap];
+        let sp = slots.as_mut_ptr();
+        macro_rules! intern {
+            ($h:expr, $loc:expr) => {{
+                let h = $h;
+                let mut i = h as usize & mask;
+                loop {
+                    let s = &mut *sp.add(i);
+                    if s.key == h {
+                        break s.person as u32;
+                    }
+                    if s.key == 0 {
+                        let id = hashes.len() as u32;
+                        s.key = h;
+                        s.person = id as u64;
+                        hashes.push(h);
+                        locs.push($loc);
+                        parent.push(id);
+                        break id;
+                    }
+                    i = (i + 1) & mask;
+                }
+            }};
+        }
+        // ids first (table probes prefetched), then the unions (parent entries prefetched): the two
+        // kinds of random access do not wait on each other
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        if LINK2 {
+            pairs.reserve(raw.len());
+            for (i, l) in raw.iter().enumerate() {
+                if i + 8 < raw.len() {
+                    let n = raw.get_unchecked(i + 8);
+                    _mm_prefetch(sp.add(n.ha as usize & mask) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(sp.add(n.hb as usize & mask) as *const i8, _MM_HINT_T0);
+                }
+                let a = intern!(l.ha, l.la);
+                let b = intern!(l.hb, l.lb);
+                pairs.push((a, b));
+            }
+        }
+        let npairs = if LINK2 { pairs.len() } else { raw.len() };
+        for i in 0..npairs {
+            let (a, b) = if LINK2 {
+                if i + 16 < npairs {
+                    let (na, nb) = *pairs.get_unchecked(i + 16);
+                    _mm_prefetch(parent.as_ptr().add(na as usize) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(parent.as_ptr().add(nb as usize) as *const i8, _MM_HINT_T0);
+                }
+                *pairs.get_unchecked(i)
+            } else {
+                let l = raw.get_unchecked(i);
+                if i + 8 < raw.len() {
+                    let n = raw.get_unchecked(i + 8);
+                    _mm_prefetch(sp.add(n.ha as usize & mask) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(sp.add(n.hb as usize & mask) as *const i8, _MM_HINT_T0);
+                }
+                (intern!(l.ha, l.la), intern!(l.hb, l.lb))
+            };
+            let pp = parent.as_mut_ptr();
+            let mut ra = a;
+            while *pp.add(ra as usize) != ra {
+                let g = *pp.add(*pp.add(ra as usize) as usize);
+                *pp.add(ra as usize) = g;
+                ra = g;
+            }
+            let mut rb = b;
+            while *pp.add(rb as usize) != rb {
+                let g = *pp.add(*pp.add(rb as usize) as usize);
+                *pp.add(rb as usize) = g;
+                rb = g;
+            }
+            if ra != rb {
+                if ra < rb {
+                    *pp.add(rb as usize) = ra;
+                } else {
+                    *pp.add(ra as usize) = rb;
+                }
+            }
+        }
     }
     let n = hashes.len();
     let tb1 = tb0.elapsed();
@@ -2986,7 +3105,9 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
         let p = parent[i] as usize;
         parent[i] = parent[p];
     }
-    let prefix: Vec<u64> = locs.iter().map(|&l| prefix_of(l)).collect();
+    if !linkp {
+        prefix = locs.iter().map(|&l| prefix_of(l)).collect();
+    }
     let mut minid: Vec<u32> = (0..n as u32).collect();
     for i in 0..n {
         let r = parent[i] as usize;
@@ -3050,7 +3171,7 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
             names[j] = LSlot { key: ph, person: locs[m] };
         }
     }
-    drop(slots);
+    // (the intern table of the non-partitioned build is dropped with its branch)
     if std::env::var_os("SS_LMSTAT").is_some() {
         eprintln!("build_links: intern+union {:?}, roots+names {:?}, final {:?}", tb1, tb2 - tb1, tb0.elapsed() - tb2);
         let no: u32 = ovf.iter().map(|w| w.count_ones()).sum();
@@ -3875,6 +3996,8 @@ fn main() {
                                     hb: hash(p.add(st[1] as usize), lb),
                                     la: (((s + st[0] as usize) as u64) << 24) | la as u64,
                                     lb: (((s + st[1] as usize) as u64) << 24) | lb as u64,
+                                    pa: prefix_of((((s + st[0] as usize) as u64) << 24) | la as u64),
+                                    pb: prefix_of((((s + st[1] as usize) as u64) << 24) | lb as u64),
                                 });
                             }
                             s += len + 1;
@@ -3906,6 +4029,8 @@ fn main() {
                                     hb: hash(p.add(st[1] as usize), lb),
                                     la: (((s + st[0] as usize) as u64) << 24) | la as u64,
                                     lb: (((s + st[1] as usize) as u64) << 24) | lb as u64,
+                                    pa: prefix_of((((s + st[0] as usize) as u64) << 24) | la as u64),
+                                    pb: prefix_of((((s + st[1] as usize) as u64) << 24) | lb as u64),
                                 });
                             }
                             s += len + 1;

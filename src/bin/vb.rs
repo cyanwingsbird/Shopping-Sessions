@@ -970,6 +970,35 @@ const PFG: usize = 0;
 const PFD2: usize = 8;
 /// pin each thread to one of the allowed CPUs
 const PIN: bool = true;
+/// how threads are placed (SS_PINMODE overrides): 0 none, 1 allowed CPUs in order,
+/// 2 one hyperthread of every physical core first, 3 like 2 but no pinning when more CPUs are allowed than threads
+const PINMODE: usize = 1;
+
+/// Allowed CPUs reordered so the first hyperthread of every physical core comes before any sibling
+/// (sysfs thread_siblings_list; the list is returned unchanged if it cannot be read).
+fn core_first(v: Vec<usize>) -> Vec<usize> {
+    let mut keyed: Vec<(usize, usize, usize)> = Vec::with_capacity(v.len());
+    let mut seen: Vec<(usize, usize)> = Vec::new();
+    for (i, &c) in v.iter().enumerate() {
+        let path = format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list");
+        let Ok(t) = std::fs::read_to_string(&path) else { return v };
+        let first: String = t.trim().chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        let Ok(core) = first.parse::<usize>() else { return v };
+        let rank = match seen.iter_mut().find(|e| e.0 == core) {
+            Some(e) => {
+                e.1 += 1;
+                e.1
+            }
+            None => {
+                seen.push((core, 0));
+                0
+            }
+        };
+        keyed.push((rank, i, c));
+    }
+    keyed.sort();
+    keyed.into_iter().map(|k| k.2).collect()
+}
 /// stage 2: link-table prefetch distance (records)
 const PF2: usize = 24;
 /// clicks are mapped to persons this many clicks after their link-table line was prefetched
@@ -998,6 +1027,8 @@ const WC2K: usize = 8;
 const PFD: usize = 0;
 /// all threads parse the link files before thread 0 builds the map
 const PLINKS: bool = true;
+/// links: ids interned in 256 hash partitions (each partition's table in L2), prefixes taken at parse time
+const LINKP: bool = true;
 /// ids of up to 16 bytes hashed with a single multiply
 const HASH1: bool = true;
 /// find line ends with a separate pass over each 64 KB block (else: from the splitter, line by line)
@@ -1008,12 +1039,20 @@ const RELEASE: bool = true;
 const NAMECP: bool = true;
 /// stage 1: ISO ts with an offset parsed with ingest_ts in the same SIMD pass as the Z form
 const ISOM: bool = true;
+/// stage-2 lookups: each record's bucket found once (at its prefetch) and kept in a ring
+const BPRING: bool = true;
+/// input page tables dropped in 32 MB pieces by threads done writing, once stage 3 is over everywhere
+const RELEASE2: bool = true;
+/// stage-3 assists: day block of each session kept, pdays ends with a sentinel
+const ASBLK: bool = true;
+/// link build: all ids first, then the unions with the parent entries prefetched
+const LINK2: bool = false;
 /// MADV_WILLNEED on every input file at startup (serial; useless on the scorer's tmpfs)
 const WILLNEED: bool = false;
 /// stage-3 person table: initial capacity n / GTDIV slots (grows when half full)
 const GTDIV: usize = 4;
 /// stage-3 ts radix on (ts, index) keys only; gid and price fetched by index when placing
-const RADIXK: bool = false;
+const RADIXK: bool = true;
 /// stage-2 dedup table: one 16-slot bucket per DDIV records (rounded up to a power of two)
 const DDIV: usize = 8;
 /// stage 1: user hash and type check before the timestamps (shorter live ranges)
@@ -1963,6 +2002,34 @@ unsafe fn s2_part(slices: &[(*mut Rec, usize)], bufs: &mut S2Buf, lm: &LinkMap, 
         // buffers only): the two working sets do not compete for the cache
         for s in slices.iter() {
             let recs = std::slice::from_raw_parts_mut(s.0, s.1);
+            if BPRING {
+                // the bucket each record's lookup uses is found once, PF2 records ahead (where its
+                // line is prefetched), and kept in a ring until the lookup
+                let mut ring = [(std::ptr::null::<LBucket>(), 0u64); 32];
+                let n = recs.len();
+                for j in 0..PF2.min(n) {
+                    let (bp, bit, bi) = lm.bucket_ptr(recs.get_unchecked(j).user);
+                    ring[j & 31] = (bp, ((bi as u64) << 1) | bit);
+                }
+                for i in 0..n {
+                    if i + 2 * PF2 < n {
+                        let k = recs.get_unchecked(i + 2 * PF2).user;
+                        let fi = (k >> 32) as usize & lm.fmask;
+                        _mm_prefetch(lm.filt.as_ptr().add(fi >> 6) as *const i8, _MM_HINT_T0);
+                    }
+                    if i + PF2 < n {
+                        let (bp, bit, bi) = lm.bucket_ptr(recs.get_unchecked(i + PF2).user);
+                        _mm_prefetch(bp as *const i8, _MM_HINT_T0);
+                        *ring.get_unchecked_mut((i + PF2) & 31) = (bp, ((bi as u64) << 1) | bit);
+                    }
+                    let (bp, ib) = *ring.get_unchecked(i & 31);
+                    let r = recs.get_unchecked_mut(i);
+                    let (pu, linked) = lm.map_at(r.user, bp, ib & 1, (ib >> 1) as usize);
+                    r.eh = pu;
+                    r.user = linked as u64;
+                }
+                continue;
+            }
             for i in 0..recs.len() {
                 // filter word 2*PF2 records ahead, the table line PF2 ahead
                 if i + 2 * PF2 < recs.len() {
@@ -2054,6 +2121,7 @@ struct S3 {
     cpos: Vec<u32>,
     active: Vec<u32>,
     name_buf: Vec<u8>,
+    sblk: Vec<u32>,
 }
 struct S3Ctx<'a> {
     lm: &'a LinkMap,
@@ -2068,7 +2136,7 @@ struct S3Ctx<'a> {
 #[allow(unused_mut, unused_variables)]
 unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &mut S3, out: &mut UOut, cell: &mut [Cell], asst_cells: &mut [u32], cx: &S3Ctx, ph: &mut [u64; 8]) {
     let S3Ctx { lm, cat_names, cat_rank, ncamp, nd, day_off, day_base } = *cx;
-    let S3 { gt, gids, rtmp, rv2, rg2, vals, cgids, ctmp, ctmp2, cg2, eoff, coff, ginfo, gperson, evs, cks, catsum, touched, ccnt, astart, pdays, cpos, active, name_buf } = b;
+    let S3 { gt, gids, rtmp, rv2, rg2, vals, cgids, ctmp, ctmp2, cg2, eoff, coff, ginfo, gperson, evs, cks, catsum, touched, ccnt, astart, pdays, cpos, active, name_buf, sblk } = b;
     let n: usize = es.iter().map(|x| x.1).sum();
     if n == 0 {
         return;
@@ -2486,11 +2554,29 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
         let mut i = 0;
         let mut sidx = 0u32;
         pdays.clear();
+        if ASBLK {
+            pdays.push((u32::MAX, u32::MAX));
+            sblk.clear();
+        }
         // add sessions [i0, i1) of campaign a to its assists, day by day
         macro_rules! assist {
             ($a:expr, $i0:expr, $i1:expr) => {{
                 let (a, i0, i1) = ($a as usize, $i0, $i1);
-                if i1 > i0 {
+                if ASBLK && i1 > i0 {
+                    // sessions [i0, i1) day block by day block: the block of session i0 is known, and
+                    // pdays ends with a sentinel (no bounds checks)
+                    let mut k = *sblk.get_unchecked(i0 as usize) as usize;
+                    loop {
+                        let (d, s0) = *pdays.get_unchecked(k);
+                        let s1 = pdays.get_unchecked(k + 1).1;
+                        let (lo, hi) = (i0.max(s0), i1.min(s1));
+                        *asst_cells.get_unchecked_mut(a * nd + d as usize) += hi - lo;
+                        k += 1;
+                        if pdays.get_unchecked(k).1 >= i1 {
+                            break;
+                        }
+                    }
+                } else if i1 > i0 {
                     let mut k = pdays.len() - 1;
                     while pdays.get_unchecked(k).1 > i0 {
                         k -= 1;
@@ -2561,7 +2647,10 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
                     flush!();
                 }
                 cur_day = day;
-                if ASSIST_IV {
+                if ASBLK {
+                    *pdays.last_mut().unwrap_unchecked() = (day, sidx);
+                    pdays.push((u32::MAX, u32::MAX));
+                } else if ASSIST_IV {
                     pdays.push((day, sidx));
                 }
                 r_sessions = 0;
@@ -2648,6 +2737,9 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
                     }
                 }
             }
+            if ASBLK {
+                sblk.push((pdays.len() - 2) as u32);
+            }
             sidx += 1;
             let ce = cell.get_unchecked_mut(camp * nd + day as usize);
             ce.sessions += 1;
@@ -2675,6 +2767,8 @@ struct LinkRaw {
     hb: u64,
     la: u64,
     lb: u64,
+    pa: u64, // first 8 bytes, big-endian (prefix_of), read while the line is in cache
+    pb: u64,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -2722,6 +2816,11 @@ impl LinkMap {
     #[inline(always)]
     unsafe fn map(&self, k: u64) -> (u64, bool) {
         let (bp, bit, i) = self.bucket_ptr(k);
+        self.map_at(k, bp, bit, i)
+    }
+    /// map with the bucket already found (bucket_ptr)
+    #[inline(always)]
+    unsafe fn map_at(&self, k: u64, bp: *const LBucket, bit: u64, i: usize) -> (u64, bool) {
         let b = &*bp;
         let keys = _mm256_load_si256(b.keys.as_ptr() as *const __m256i);
         let eq = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(k as i64)))) as u32;
@@ -2795,48 +2894,106 @@ unsafe fn prefix_of(loc: u64) -> u64 {
         v & (!0u64 << (64 - 8 * len))
     }
 }
+/// Link ids interned partition by partition (256 partitions by bits 24..32 of the hash), so each
+/// partition's table stays in L2; ids are numbered in partition order. Returns each endpoint's id
+/// (2i: side a of link i, 2i + 1: side b).
+unsafe fn intern_part(raw: &[LinkRaw], hashes: &mut Vec<u64>, locs: &mut Vec<u64>, prefix: &mut Vec<u64>) -> Vec<u32> {
+    #[derive(Clone, Copy)]
+    struct Ep {
+        h: u64,
+        loc: u64,
+        pre: u64,
+        e: u64,
+    }
+    const PB: u32 = 8;
+    const NP: usize = 1 << PB;
+    let pof = |h: u64| ((h as u32) >> (32 - PB)) as usize;
+    let _ti = Instant::now();
+    let ne = raw.len() * 2;
+    let mut cnt = vec![0usize; NP + 1];
+    for l in raw.iter() {
+        *cnt.get_unchecked_mut(pof(l.ha) + 1) += 1;
+        *cnt.get_unchecked_mut(pof(l.hb) + 1) += 1;
+    }
+    for p in 0..NP {
+        cnt[p + 1] += cnt[p];
+    }
+    let mut eps: Vec<Ep> = Vec::with_capacity(ne);
+    eps.set_len(ne);
+    let mut pos = cnt.clone();
+    let ep = eps.as_mut_ptr();
+    for (i, l) in raw.iter().enumerate() {
+        let p = pof(l.ha);
+        *ep.add(*pos.get_unchecked(p)) = Ep { h: l.ha, loc: l.la, pre: l.pa, e: (2 * i) as u64 };
+        *pos.get_unchecked_mut(p) += 1;
+        let p = pof(l.hb);
+        *ep.add(*pos.get_unchecked(p)) = Ep { h: l.hb, loc: l.lb, pre: l.pb, e: (2 * i + 1) as u64 };
+        *pos.get_unchecked_mut(p) += 1;
+    }
+    let mut ids = vec![0u32; ne];
+    if std::env::var_os("SS_LMSTAT").is_some() {
+        eprintln!("scatter done {:?}", _ti.elapsed());
+    }
+    let maxp = (0..NP).map(|p| cnt[p + 1] - cnt[p]).max().unwrap_or(0);
+    let tcap = (maxp * 2).next_power_of_two().max(16);
+    let mut tk = vec![0u64; tcap];
+    let mut tv = vec![0u32; tcap];
+    for p in 0..NP {
+        let (a, b) = (cnt[p], cnt[p + 1]);
+        if a == b {
+            continue;
+        }
+        let cap = ((b - a) * 2).next_power_of_two().max(16);
+        let m = cap - 1;
+        tk[..cap].fill(0);
+        for k in a..b {
+            let x = *ep.add(k);
+            let mut j = x.h as usize & m;
+            let id = loop {
+                let kk = *tk.get_unchecked(j);
+                if kk == x.h {
+                    break *tv.get_unchecked(j);
+                }
+                if kk == 0 {
+                    let id = hashes.len() as u32;
+                    *tk.get_unchecked_mut(j) = x.h;
+                    *tv.get_unchecked_mut(j) = id;
+                    hashes.push(x.h);
+                    locs.push(x.loc);
+                    prefix.push(x.pre);
+                    break id;
+                }
+                j = (j + 1) & m;
+            };
+            *ids.get_unchecked_mut(x.e as usize) = id;
+        }
+    }
+    ids
+}
 unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
     if raw.is_empty() {
         return LinkMap { mask: 0, nb: 1, slots: vec![LB0], ovf: vec![0], names: vec![LSlot { key: 0, person: 0 }], nmask: 0, filt: vec![0], fmask: 0, empty: LB0 };
     }
     let tb0 = Instant::now();
-    let cap = (raw.len() * 2).next_power_of_two().max(16);
-    let mask = cap - 1;
-    let mut slots = vec![LSlot { key: 0, person: 0 }; cap];
     let mut hashes: Vec<u64> = Vec::with_capacity(raw.len() * 2);
     let mut locs: Vec<u64> = Vec::with_capacity(raw.len() * 2);
     let mut parent: Vec<u32> = Vec::with_capacity(raw.len() * 2);
-    let sp = slots.as_mut_ptr();
-    macro_rules! intern {
-        ($h:expr, $loc:expr) => {{
-            let h = $h;
-            let mut i = h as usize & mask;
-            loop {
-                let s = &mut *sp.add(i);
-                if s.key == h {
-                    break s.person as u32;
-                }
-                if s.key == 0 {
-                    let id = hashes.len() as u32;
-                    s.key = h;
-                    s.person = id as u64;
-                    hashes.push(h);
-                    locs.push($loc);
-                    parent.push(id);
-                    break id;
-                }
-                i = (i + 1) & mask;
-            }
-        }};
-    }
-    for (i, l) in raw.iter().enumerate() {
-        if i + 8 < raw.len() {
-            let n = raw.get_unchecked(i + 8);
-            _mm_prefetch(sp.add(n.ha as usize & mask) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(sp.add(n.hb as usize & mask) as *const i8, _MM_HINT_T0);
+    let mut prefix: Vec<u64> = Vec::new();
+    let linkp = LINKP && std::env::var_os("SS_LINKP").map_or(true, |v| v != "0");
+    if linkp {
+        prefix.reserve(raw.len() * 2);
+        let ids = intern_part(raw, &mut hashes, &mut locs, &mut prefix);
+        if std::env::var_os("SS_LMSTAT").is_some() {
+            eprintln!("intern_part {:?}", tb0.elapsed());
         }
-        let a = intern!(l.ha, l.la);
-        let b = intern!(l.hb, l.lb);
+        parent.extend(0..hashes.len() as u32);
+        let np = raw.len();
+        for i in 0..np {
+            if i + 16 < np {
+                _mm_prefetch(parent.as_ptr().add(*ids.get_unchecked(2 * (i + 16)) as usize) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(parent.as_ptr().add(*ids.get_unchecked(2 * (i + 16) + 1) as usize) as *const i8, _MM_HINT_T0);
+            }
+            let (a, b) = (*ids.get_unchecked(2 * i), *ids.get_unchecked(2 * i + 1));
         let pp = parent.as_mut_ptr();
         let mut ra = a;
         while *pp.add(ra as usize) != ra {
@@ -2857,6 +3014,89 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
                 *pp.add(ra as usize) = rb;
             }
         }
+        }
+    } else {
+        let cap = (raw.len() * 2).next_power_of_two().max(16);
+        let mask = cap - 1;
+        let mut slots = vec![LSlot { key: 0, person: 0 }; cap];
+        let sp = slots.as_mut_ptr();
+        macro_rules! intern {
+            ($h:expr, $loc:expr) => {{
+                let h = $h;
+                let mut i = h as usize & mask;
+                loop {
+                    let s = &mut *sp.add(i);
+                    if s.key == h {
+                        break s.person as u32;
+                    }
+                    if s.key == 0 {
+                        let id = hashes.len() as u32;
+                        s.key = h;
+                        s.person = id as u64;
+                        hashes.push(h);
+                        locs.push($loc);
+                        parent.push(id);
+                        break id;
+                    }
+                    i = (i + 1) & mask;
+                }
+            }};
+        }
+        // ids first (table probes prefetched), then the unions (parent entries prefetched): the two
+        // kinds of random access do not wait on each other
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        if LINK2 {
+            pairs.reserve(raw.len());
+            for (i, l) in raw.iter().enumerate() {
+                if i + 8 < raw.len() {
+                    let n = raw.get_unchecked(i + 8);
+                    _mm_prefetch(sp.add(n.ha as usize & mask) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(sp.add(n.hb as usize & mask) as *const i8, _MM_HINT_T0);
+                }
+                let a = intern!(l.ha, l.la);
+                let b = intern!(l.hb, l.lb);
+                pairs.push((a, b));
+            }
+        }
+        let npairs = if LINK2 { pairs.len() } else { raw.len() };
+        for i in 0..npairs {
+            let (a, b) = if LINK2 {
+                if i + 16 < npairs {
+                    let (na, nb) = *pairs.get_unchecked(i + 16);
+                    _mm_prefetch(parent.as_ptr().add(na as usize) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(parent.as_ptr().add(nb as usize) as *const i8, _MM_HINT_T0);
+                }
+                *pairs.get_unchecked(i)
+            } else {
+                let l = raw.get_unchecked(i);
+                if i + 8 < raw.len() {
+                    let n = raw.get_unchecked(i + 8);
+                    _mm_prefetch(sp.add(n.ha as usize & mask) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(sp.add(n.hb as usize & mask) as *const i8, _MM_HINT_T0);
+                }
+                (intern!(l.ha, l.la), intern!(l.hb, l.lb))
+            };
+            let pp = parent.as_mut_ptr();
+            let mut ra = a;
+            while *pp.add(ra as usize) != ra {
+                let g = *pp.add(*pp.add(ra as usize) as usize);
+                *pp.add(ra as usize) = g;
+                ra = g;
+            }
+            let mut rb = b;
+            while *pp.add(rb as usize) != rb {
+                let g = *pp.add(*pp.add(rb as usize) as usize);
+                *pp.add(rb as usize) = g;
+                rb = g;
+            }
+            if ra != rb {
+                if ra < rb {
+                    *pp.add(rb as usize) = ra;
+                } else {
+                    *pp.add(ra as usize) = rb;
+                }
+            }
+        }
     }
     let n = hashes.len();
     let tb1 = tb0.elapsed();
@@ -2865,7 +3105,9 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
         let p = parent[i] as usize;
         parent[i] = parent[p];
     }
-    let prefix: Vec<u64> = locs.iter().map(|&l| prefix_of(l)).collect();
+    if !linkp {
+        prefix = locs.iter().map(|&l| prefix_of(l)).collect();
+    }
     let mut minid: Vec<u32> = (0..n as u32).collect();
     for i in 0..n {
         let r = parent[i] as usize;
@@ -2929,7 +3171,7 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
             names[j] = LSlot { key: ph, person: locs[m] };
         }
     }
-    drop(slots);
+    // (the intern table of the non-partitioned build is dropped with its branch)
     if std::env::var_os("SS_LMSTAT").is_some() {
         eprintln!("build_links: intern+union {:?}, roots+names {:?}, final {:?}", tb1, tb2 - tb1, tb0.elapsed() - tb2);
         let no: u32 = ovf.iter().map(|w| w.count_ones()).sum();
@@ -3666,6 +3908,8 @@ fn main() {
     let links_ready = std::sync::atomic::AtomicBool::new(false);
     let next_p1 = AtomicUsize::new(0);
     let next_q = AtomicUsize::new(0);
+    let s3_done = AtomicUsize::new(0);
+    let rel_next = AtomicUsize::new(0);
     let barrier = Barrier::new(nthreads);
     let cpus: Vec<usize> = {
         let mut m = [0u64; 16];
@@ -3677,7 +3921,14 @@ fn main() {
                 }
             }
         }
-        if v.len() < nthreads { Vec::new() } else { v }
+        let mode = envn("SS_PINMODE").unwrap_or(PINMODE);
+        if v.len() < nthreads || mode == 0 || (mode == 3 && v.len() > nthreads) {
+            Vec::new()
+        } else if mode >= 2 {
+            core_first(v)
+        } else {
+            v
+        }
     };
     // link files are parsed by all threads first (256 KB chunks), then one thread builds the map
     let mut lchunks: Vec<Chunk> = Vec::new();
@@ -3694,13 +3945,14 @@ fn main() {
     let _ = std::fs::create_dir_all(format!("{out_dir}/user_daily"));
     let _ = std::fs::create_dir_all(format!("{out_dir}/campaign_daily"));
     if timing {
-        eprintln!("setup {:?} (manifest {:?} read {:?} dims {:?} mmap {:?}) v4={} threads={} p1={} p1c={} q={} chunks={}", t0.elapsed(), tsu0, tsu0b, tsu1, tsu2, cfg!(target_feature = "avx512bw"), nthreads, p1, p1c, q, chunks.len());
+        eprintln!("setup {:?} (manifest {:?} read {:?} dims {:?} mmap {:?}) v4={} threads={} p1={} p1c={} q={} chunks={} cpus={:?}", t0.elapsed(), tsu0, tsu0b, tsu1, tsu2, cfg!(target_feature = "avx512bw"), nthreads, p1, p1c, q, chunks.len(), cpus);
     }
 
     std::thread::scope(|sc| {
         for tid in 0..nthreads {
             let (chunks, ev1, ck1, ev2, ck2, cells, linkmap, assists) = (&chunks, &ev1, &ck1, &ev2, &ck2, &cells, &linkmap, &assists);
             let (next_chunk, next_p1, next_q, barrier) = (&next_chunk, &next_p1, &next_q, &barrier);
+            let (s3_done, rel_next) = (&s3_done, &rel_next);
             let links_ready = &links_ready;
             let (lchunks, next_lchunk, lraw) = (&lchunks, &next_lchunk, &lraw);
             let (camp_tab, camp_short, ln_segs, out_dir) = (&camp_tab, &camp_short, &ln_segs, &out_dir);
@@ -3744,6 +3996,8 @@ fn main() {
                                     hb: hash(p.add(st[1] as usize), lb),
                                     la: (((s + st[0] as usize) as u64) << 24) | la as u64,
                                     lb: (((s + st[1] as usize) as u64) << 24) | lb as u64,
+                                    pa: prefix_of((((s + st[0] as usize) as u64) << 24) | la as u64),
+                                    pb: prefix_of((((s + st[1] as usize) as u64) << 24) | lb as u64),
                                 });
                             }
                             s += len + 1;
@@ -3775,6 +4029,8 @@ fn main() {
                                     hb: hash(p.add(st[1] as usize), lb),
                                     la: (((s + st[0] as usize) as u64) << 24) | la as u64,
                                     lb: (((s + st[1] as usize) as u64) << 24) | lb as u64,
+                                    pa: prefix_of((((s + st[0] as usize) as u64) << 24) | la as u64),
+                                    pb: prefix_of((((s + st[1] as usize) as u64) << 24) | lb as u64),
                                 });
                             }
                             s += len + 1;
@@ -4575,7 +4831,7 @@ fn main() {
                 let mut cpos = vec![0u32; ncamp + 1];
                 let mut active: Vec<u32> = Vec::new();
                 let mut name_buf: Vec<u8> = Vec::new();
-                let mut s3b = S3 { gt: GTable { keys: Vec::new(), vals: Vec::new(), mask: 0 }, gids: Vec::new(), rtmp: Vec::new(), rv2: Vec::new(), rg2: Vec::new(), vals: Vec::new(), cgids: Vec::new(), ctmp: Vec::new(), ctmp2: Vec::new(), cg2: Vec::new(), eoff: Vec::new(), coff: Vec::new(), ginfo: Vec::new(), gperson: Vec::new(), evs: Vec::new(), cks: Vec::new(), catsum: vec![0u64; 256], touched: Vec::new(), ccnt: vec![0u32; ncamp + 1], astart: vec![0u32; ncamp + 1], pdays: Vec::new(), cpos: vec![0u32; ncamp + 1], active: Vec::new(), name_buf: Vec::new() };
+                let mut s3b = S3 { gt: GTable { keys: Vec::new(), vals: Vec::new(), mask: 0 }, gids: Vec::new(), rtmp: Vec::new(), rv2: Vec::new(), rg2: Vec::new(), vals: Vec::new(), cgids: Vec::new(), ctmp: Vec::new(), ctmp2: Vec::new(), cg2: Vec::new(), eoff: Vec::new(), coff: Vec::new(), ginfo: Vec::new(), gperson: Vec::new(), evs: Vec::new(), cks: Vec::new(), catsum: vec![0u64; 256], touched: Vec::new(), ccnt: vec![0u32; ncamp + 1], astart: vec![0u32; ncamp + 1], pdays: Vec::new(), cpos: vec![0u32; ncamp + 1], active: Vec::new(), name_buf: Vec::new(), sblk: Vec::new() };
                 // biggest partitions first (whale persons), so no thread is left finishing a big one alone
                 let mut qorder: Vec<(usize, u32)> = (0..q)
                     .map(|qi| ((0..nthreads).map(|t| ev2[t].get()[qi].len()).sum::<usize>(), qi as u32))
@@ -5147,6 +5403,9 @@ fn main() {
                     }
                 }
                 perf.stage(2);
+                if RELEASE2 {
+                    s3_done.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
                 for (i, v) in ph.iter().enumerate() {
                     PHASE[i].fetch_add(*v, Relaxed);
                 }
@@ -5182,7 +5441,24 @@ fn main() {
                     }
                 }
                 std::mem::forget(out);
-                if RELEASE {
+                if RELEASE2 {
+                    // drop the input's page-table entries in parallel (left to exit, one thread unmaps them
+                    // all) once every thread is past stage 3; threads that are done writing take 32 MB
+                    // pieces while the last ones still write
+                    while s3_done.load(std::sync::atomic::Ordering::Acquire) < nthreads {
+                        // sleep, not spin: the sibling hyperthread may be the one still in stage 3
+                        std::thread::sleep(std::time::Duration::from_micros(20));
+                    }
+                    const PIECE: usize = 32 << 20;
+                    loop {
+                        let k = rel_next.fetch_add(1, Relaxed);
+                        let a = k * PIECE;
+                        if a >= total {
+                            break;
+                        }
+                        madvise(base().add(a) as *mut u8, PIECE.min(total - a), 4);
+                    }
+                } else if RELEASE {
                     // drop the input's page-table entries in parallel: left to exit, one thread unmaps them all
                     barrier.wait();
                     let step = (total / nthreads + (2 << 20)) & !((2usize << 20) - 1);
@@ -5321,6 +5597,13 @@ fn main() {
             ru[8],
             ru[4] / 1024
         );
+    }
+    #[cfg(pgo_gen)]
+    unsafe {
+        extern "C" {
+            fn __llvm_profile_write_file() -> i32;
+        }
+        __llvm_profile_write_file();
     }
     unsafe { _exit(0) }
 }
