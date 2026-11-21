@@ -35,7 +35,8 @@ while [ $# -gt 0 ]; do
   l1=${1%%:*}; shift
   if [ $# -gt 0 ]; then l2=${1%%:*}; shift; else l2=""; fi
   n=$((n + 1))
-  printf '!%s %s %s\t0\t0\t0\t0\t%s %s\n' "$n" "$l1" "$(row $l1)" "$l2" "$( [ -n "$l2" ] && row $l2)"
+  if [ -n "$l2" ]; then r2="$l2 $(row $l2)"; else r2="cpu $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | tr -s ' ' | cut -c1-48) n$(grep -c ^processor /proc/cpuinfo) a512:$(grep -m1 -c avx512bw /proc/cpuinfo) $(grep -m1 'cpu MHz' /proc/cpuinfo | cut -d: -f2 | tr -d ' ')MHz $(grep -m1 'cache size' /proc/cpuinfo | cut -d: -f2 | tr -d ' ')"; fi
+  printf '!%s %s %s\t0\t0\t0\t0\t%s\n' "$n" "$l1" "$(row $l1)" "$r2"
 done > "$S/rows.txt"
 cat "$S/rows.txt" >&2
 SS_EMIT_TEXT="$S/rows.txt" /app/$fb x /output/user_daily/zz-report.parquet
