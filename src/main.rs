@@ -1006,6 +1006,8 @@ const SCANNL: bool = false;
 const RELEASE: bool = true;
 /// stage 3: user_id written with a fixed 32-byte copy straight from the input
 const NAMECP: bool = true;
+/// stage 1: ISO ts with an offset parsed with ingest_ts in the same SIMD pass as the Z form
+const ISOM: bool = true;
 /// stage 3: radix-sort each partition by ts instead of sorting each person's events
 const RADIX3: bool = true;
 const HIST: bool = false;
@@ -1464,9 +1466,26 @@ unsafe fn ev_lines<const STRICT: bool>(cx: &EvCtx, wc1: &mut Wc<Rec, WC1K>, evb:
         let (f2, l2) = $fld(2);
         let tp = $p.add(f2);
         let ing_ok = il == 20 && *ip.add(19) == b'Z';
-        let (t, ing) = if l2 == 20 && *tp.add(19) == b'Z' && ing_ok {
+        let c19 = *tp.add(19);
+        // ISO ts, with Z or a +hh:mm offset: one SIMD pass for ts and ingest_ts (one branch for both forms)
+        let iso = if ISOM { ((l2 == 20) & (c19 == b'Z')) | ((l2 == 25) & ((c19 == b'+') | (c19 == b'-'))) } else { (l2 == 20) & (c19 == b'Z') };
+        let (t, ing) = if iso & ing_ok {
             let (ts, g) = parse_pair_f1(tp, ip);
-            (if ts == BAD { BAD } else { ts * 1000 }, g)
+            let ts = if ISOM && l2 == 25 {
+                let (oh, b1) = dig2(tp.add(20));
+                let (om, b2) = dig2(tp.add(23));
+                if ts == BAD || (b1 | b2) != 0 || *tp.add(22) != b':' || oh > 23 || om > 59 {
+                    BAD
+                } else {
+                    let off = (oh * 3600 + om * 60) as i64;
+                    if c19 == b'+' { (ts - off) * 1000 } else { (ts + off) * 1000 }
+                }
+            } else if ts == BAD {
+                BAD
+            } else {
+                ts * 1000
+            };
+            (ts, g)
         } else {
             (parse_ts_fast(tp, l2), if ing_ok { parse_ingest(ip) } else { BAD })
         };
