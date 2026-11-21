@@ -19,7 +19,7 @@ one() {
   b=$(date +%s%N)
   echo "$1 $(( (b - a) / 1000000 )) $r" >> "$S/runs.txt"
 }
-for i in 1 2 3; do for v in $V; do one $v /app/$v; done; done
+for i in $(seq ${REPS:-3}); do for v in $V; do one $v /app/$v; done; done
 cat "$S/runs.txt" >&2
 set -- $V
 /app/$1 /data /output
