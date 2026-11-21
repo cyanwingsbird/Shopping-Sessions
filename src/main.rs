@@ -1142,28 +1142,51 @@ struct LSlot {
     key: u64,
     person: u64, // person hash (in names map: name loc = pos << 24 | len)
 }
-/// 4 slots per 64-byte line: a lookup touches one cache line (overflow goes to the next bucket)
+/// 4 keys + their 4 person hashes per 64-byte line: a lookup touches one cache line. Keys that did
+/// not fit their home bucket go to the following ones, and the home bucket's overflow bit is set.
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
-struct LBucket([LSlot; 4]);
+struct LBucket {
+    keys: [u64; 4],
+    persons: [u64; 4],
+}
+const LB0: LBucket = LBucket { keys: [0; 4], persons: [0; 4] };
 struct LinkMap {
     mask: usize, // bucket mask
     slots: Vec<LBucket>,
+    ovf: Vec<u64>, // per bucket: did an insert spill past it
     names: Vec<LSlot>,
     nmask: usize,
 }
 impl LinkMap {
+    /// (person hash, linked) for user hash k; an unlinked user is its own person. Branch-free
+    /// unless k's home bucket overflowed.
     #[inline(always)]
-    unsafe fn get(&self, k: u64) -> Option<&LSlot> {
+    unsafe fn map(&self, k: u64) -> (u64, bool) {
+        let i = k as usize & self.mask;
+        let b = self.slots.get_unchecked(i);
+        let keys = _mm256_load_si256(b.keys.as_ptr() as *const __m256i);
+        let eq = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(k as i64)))) as u32;
+        let found = eq != 0;
+        let ob = (*self.ovf.get_unchecked(i >> 6) >> (i & 63)) & ((eq == 0) as u64);
+        if ob != 0 {
+            return self.map_slow(k);
+        }
+        let pers = *b.persons.get_unchecked(((eq | 16).trailing_zeros() & 3) as usize);
+        (if found { pers } else { k }, found)
+    }
+    #[cold]
+    #[inline(never)]
+    unsafe fn map_slow(&self, k: u64) -> (u64, bool) {
         let mut i = k as usize & self.mask;
         loop {
             let b = self.slots.get_unchecked(i);
-            for s in b.0.iter() {
-                if s.key == k {
-                    return Some(s);
+            for j in 0..4 {
+                if b.keys[j] == k {
+                    return (b.persons[j], true);
                 }
-                if s.key == 0 {
-                    return None;
+                if b.keys[j] == 0 {
+                    return (k, false);
                 }
             }
             i = (i + 1) & self.mask;
@@ -1201,7 +1224,7 @@ unsafe fn prefix_of(loc: u64) -> u64 {
 }
 unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
     if raw.is_empty() {
-        return LinkMap { mask: 0, slots: vec![LBucket([LSlot { key: 0, person: 0 }; 4])], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 };
+        return LinkMap { mask: 0, slots: vec![LB0], ovf: vec![0], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 };
     }
     let cap = (raw.len() * 4).next_power_of_two().max(16);
     let mask = cap - 1;
@@ -1279,7 +1302,8 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
     // final table: id hash -> person hash, 4-slot buckets, load factor <= 0.75
     let fcap = n.div_ceil(3).next_power_of_two().max(4);
     let fmask = fcap - 1;
-    let mut fin = vec![LBucket([LSlot { key: 0, person: 0 }; 4]); fcap];
+    let mut fin = vec![LB0; fcap];
+    let mut ovf = vec![0u64; fcap.div_ceil(64)];
     let mut nroots = 0usize;
     for i in 0..n {
         if parent[i] as usize == i {
@@ -1292,14 +1316,17 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
     for i in 0..n {
         let m = minid[parent[i] as usize] as usize;
         let h = hashes[i];
-        let mut j = h as usize & fmask;
+        let home = h as usize & fmask;
+        let mut j = home;
         'ins: loop {
-            for s in fin[j].0.iter_mut() {
-                if s.key == 0 {
-                    *s = LSlot { key: h, person: hashes[m] };
+            for t in 0..4 {
+                if fin[j].keys[t] == 0 {
+                    fin[j].keys[t] = h;
+                    fin[j].persons[t] = hashes[m];
                     break 'ins;
                 }
             }
+            ovf[home >> 6] |= 1 << (home & 63);
             j = (j + 1) & fmask;
         }
         if parent[i] as usize == i {
@@ -1312,7 +1339,11 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
         }
     }
     drop(slots);
-    LinkMap { mask: fmask, slots: fin, names, nmask }
+    if std::env::var_os("SS_LMSTAT").is_some() {
+        let no: u32 = ovf.iter().map(|w| w.count_ones()).sum();
+        eprintln!("linkmap: n {} buckets {} load {:.2} overflowed {}", n, fcap, n as f64 / (4 * fcap) as f64, no);
+    }
+    LinkMap { mask: fmask, slots: fin, ovf, names, nmask }
 }
 
 // ---------------------------------------------------------------- parquet
@@ -1950,7 +1981,7 @@ fn main() {
     let ck2: Vec<Sh<Vec<Vec<RecC>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let cells: Vec<Sh<Vec<Cell>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let assists: Vec<Sh<Vec<u32>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
-    let linkmap: Sh<LinkMap> = Sh::new(LinkMap { mask: 0, slots: vec![LBucket([LSlot { key: 0, person: 0 }; 4])], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 });
+    let linkmap: Sh<LinkMap> = Sh::new(LinkMap { mask: 0, slots: vec![LB0], ovf: vec![0], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 });
     let next_chunk = AtomicUsize::new(0);
     let next_p1 = AtomicUsize::new(0);
     let next_q = AtomicUsize::new(0);
@@ -2294,10 +2325,9 @@ fn main() {
                                 }
                                 let mut o = Rec2 { user: r.user, pos: (r.pp >> 24) << 1, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
                                 if has_links {
-                                    if let Some(l) = lm.get(r.user) {
-                                        o.user = l.person;
-                                        o.pos |= 1;
-                                    }
+                                    let (pu, linked) = lm.map(r.user);
+                                    o.user = pu;
+                                    o.pos |= linked as u64;
                                 }
                                 let part = (((o.user >> 32) * q as u64) >> 32) as usize;
                                 if abl == 7 { abl_sink += o.user; continue; }
@@ -2370,9 +2400,7 @@ fn main() {
                                     continue;
                                 }
                                 if has_links {
-                                    if let Some(l) = lm.get(r.user) {
-                                        r.user = l.person;
-                                    }
+                                    r.user = lm.map(r.user).0;
                                 }
                                 let part = (((r.user >> 32) * q as u64) >> 32) as usize;
                                 wcc2.push(c2, part, r);
