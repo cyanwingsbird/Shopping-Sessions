@@ -1271,7 +1271,6 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
     if raw.is_empty() {
         return LinkMap { mask: 0, nb: 1, slots: vec![LB0], ovf: vec![0], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 };
     }
-    let tb0 = Instant::now();
     let cap = (raw.len() * 4).next_power_of_two().max(16);
     let mask = cap - 1;
     let mut slots = vec![LSlot { key: 0, person: 0 }; cap];
@@ -1331,7 +1330,6 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
         }
     }
     let n = hashes.len();
-    let tb1 = tb0.elapsed();
     // roots have the smallest index of their set; compress fully in index order
     for i in 0..n {
         let p = parent[i] as usize;
@@ -1346,7 +1344,6 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
             minid[r] = i as u32;
         }
     }
-    let tb2 = tb0.elapsed();
     // final table: id hash -> person hash, 4-slot buckets, load factor <= 0.75. Only ids that are not
     // their person's name: a person's smallest id maps to itself, which is also what a miss returns.
     let nn = (0..n).filter(|&i| minid[parent[i] as usize] as usize != i).count();
@@ -1363,18 +1360,8 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
     let ncap = (nroots * 2).next_power_of_two().max(16);
     let nmask = ncap - 1;
     let mut names = vec![LSlot { key: 0, person: 0 }; ncap];
-    // minid of each id's root, fetched ahead (random reads), then the table inserts with prefetch
-    let pm: Vec<u32> = (0..n).map(|i| minid[parent[i] as usize]).collect();
     for i in 0..n {
-        if i + 16 < n {
-            let h2 = *hashes.get_unchecked(i + 16);
-            _mm_prefetch(fin.as_ptr().add(fb(h2)) as *const i8, _MM_HINT_T0);
-            if *parent.get_unchecked(i + 16) as usize == i + 16 {
-                let ph2 = *hashes.get_unchecked(*pm.get_unchecked(i + 16) as usize);
-                _mm_prefetch(names.as_ptr().add(ph2 as usize & nmask) as *const i8, _MM_HINT_T0);
-            }
-        }
-        let m = *pm.get_unchecked(i) as usize;
+        let m = minid[parent[i] as usize] as usize;
         let h = hashes[i];
         let home = fb(h);
         let mut j = home;
@@ -1403,7 +1390,6 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
     }
     drop(slots);
     if std::env::var_os("SS_LMSTAT").is_some() {
-        eprintln!("build_links: intern+union {:?}, roots+names {:?}, final {:?}", tb1, tb2 - tb1, tb0.elapsed() - tb2);
         let no: u32 = ovf.iter().map(|w| w.count_ones()).sum();
         eprintln!("linkmap: n {} stored {} buckets {} load {:.2} overflowed {}", n, nn, fcap, nn as f64 / (4 * fcap) as f64, no);
     }
@@ -2101,9 +2087,9 @@ fn main() {
     let est_ev = ev_bytes / 72 + 1;
     let est_ck = ck_bytes / 44 + 1;
     let pow2 = |x: usize, lo: usize, hi: usize| x.next_power_of_two().clamp(lo, hi);
-    let p1 = envn("SS_P1").unwrap_or_else(|| pow2(est_ev / 32768, 1, 2048));
+    let p1 = envn("SS_P1").unwrap_or_else(|| pow2(est_ev / 32768, 1, 1024));
     let p1c = envn("SS_P1C").unwrap_or_else(|| pow2(est_ck / 65536, 1, 128));
-    let q = envn("SS_Q").unwrap_or_else(|| pow2(est_ev / 32768, 1, 2048));
+    let q = envn("SS_Q").unwrap_or_else(|| pow2(est_ev / 32768, 1, 1024));
 
     // ---- shared state
     let ev1: Vec<Sh<Vec<Vec<Rec>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
@@ -2292,10 +2278,6 @@ fn main() {
                             let line_at = s;
                             s = s0 + *nlbuf.get_unchecked(j) as usize + 1;
                             let p = base().add(line_at);
-                            if abl == 0 {
-                                abl_sink += line_at as u64;
-                                continue;
-                            }
                             let sp = if strict { Sp7 { kind: 2, ..Default::default() } } else { split_ev7f(p, c.fe - line_at) };
                             if sp.kind >= 1 {
                                 // malformed, or a shape the fast splitter does not take: general path
