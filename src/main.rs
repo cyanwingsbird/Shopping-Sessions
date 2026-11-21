@@ -455,6 +455,17 @@ unsafe fn parse_dt(p: *const u8) -> i64 {
     };
     days * 86400 + (h * 3600 + mi * 60 + s) as i64
 }
+/// rare fallbacks, kept out of line so the hot parsers carry no state for them
+#[cold]
+#[inline(never)]
+unsafe fn parse_dt_cold(p: *const u8) -> i64 {
+    parse_dt(p)
+}
+#[cold]
+#[inline(never)]
+unsafe fn parse_dt_simd_cold(p: *const u8) -> i64 {
+    parse_dt_simd(p)
+}
 /// SIMD "YYYY-MM-DDTHH:MM:SS" at p -> epoch seconds or BAD. Reads p[0..19].
 #[inline(always)]
 unsafe fn parse_dt_simd(p: *const u8) -> i64 {
@@ -524,7 +535,7 @@ unsafe fn parse_pair_f1(t: *const u8, g: *const u8) -> (i64, i64) {
     let ing = if gi < 64 * 512 && (gt >> 16) & 0x3FFF == 0 && *DAYTAB.get_unchecked(gi as usize) != i32::MIN {
         *DAYTAB.get_unchecked(gi as usize) as i64 * 86400 + (gx >> 32) as i64
     } else {
-        parse_dt_simd(g)
+        parse_dt_simd_cold(g)
     };
     let ts = if sepok && (dig & 0x3FFF) == 0x3FFF && (gt & 0xFFFF) == 0 {
         if ti < 64 * 512 {
@@ -535,7 +546,7 @@ unsafe fn parse_pair_f1(t: *const u8, g: *const u8) -> (i64, i64) {
                 dd as i64 * 86400 + (tx >> 32) as i64
             }
         } else {
-            parse_dt(t)
+            parse_dt_cold(t)
         }
     } else {
         BAD
@@ -556,11 +567,11 @@ unsafe fn parse_ingest(p: *const u8) -> i64 {
     let mo = _mm_extract_epi16::<2>(pr) as u32;
     let d = _mm_extract_epi16::<3>(pr) as u32;
     if y.wrapping_sub(2000) >= 64 || mo > 12 || d > 31 {
-        return parse_dt_simd(p);
+        return parse_dt_simd_cold(p);
     }
     let days = *DAYTAB.get_unchecked(((y - 2000) * 512 + mo * 32 + d) as usize);
     if days == i32::MIN {
-        return parse_dt_simd(p);
+        return parse_dt_simd_cold(p);
     }
     let h = _mm_extract_epi16::<4>(pr) as i64;
     let mi = _mm_extract_epi16::<5>(pr) as i64;
@@ -993,6 +1004,8 @@ const HASH1: bool = true;
 const SCANNL: bool = false;
 /// at the end, drop the input mapping's page-table entries in parallel (else exit does it on one thread)
 const RELEASE: bool = true;
+/// stage 3: user_id written with a fixed 32-byte copy straight from the input
+const NAMECP: bool = true;
 /// stage 3: radix-sort each partition by ts instead of sorting each person's events
 const RADIX3: bool = true;
 const HIST: bool = false;
@@ -1430,8 +1443,9 @@ struct EvCtx<'a> {
     strict: bool,
 }
 #[inline(never)]
-unsafe fn ev_lines(cx: &EvCtx, wc1: &mut Wc<Rec, WC1K>, evb: &mut [Vec<Rec>], mut s: usize, cb: usize, fe: usize) {
-    let EvCtx { prod_tab, cat_unknown, ws, we, ing_base, base_ms, p1, strict } = *cx;
+unsafe fn ev_lines<const STRICT: bool>(cx: &EvCtx, wc1: &mut Wc<Rec, WC1K>, evb: &mut [Vec<Rec>], mut s: usize, cb: usize, fe: usize) {
+    let EvCtx { prod_tab, cat_unknown, ws, we, ing_base, base_ms, p1, .. } = *cx;
+    let strict = STRICT;
     let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
     let abl = 0usize;
     let mut abl_sink = 0u64;
@@ -1554,8 +1568,9 @@ struct CkCtx<'a> {
     strict: bool,
 }
 #[inline(never)]
-unsafe fn ck_lines(cx: &CkCtx, wcc2: &mut Wc<RecC, 8>, c2: &mut [Vec<RecC>], cring: &mut [RecC; CRING], crn: &mut usize, mut s: usize, cb: usize, fe: usize) {
-    let CkCtx { camp_tab, lm, base_ms, we, q, strict } = *cx;
+unsafe fn ck_lines<const STRICT: bool>(cx: &CkCtx, wcc2: &mut Wc<RecC, 8>, c2: &mut [Vec<RecC>], cring: &mut [RecC; CRING], crn: &mut usize, mut s: usize, cb: usize, fe: usize) {
+    let CkCtx { camp_tab, lm, base_ms, we, q, .. } = *cx;
+    let strict = STRICT;
     let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
     while s < cb {
         let line = s;
@@ -2225,12 +2240,15 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
         }
         // name
         let info = ginfo[g];
-        name_buf.clear();
-        if info & 1 != 0 {
-            name_buf.extend_from_slice(name_bytes(lm.name(gperson[g])));
+        let (nptr, nlen) = if info & 1 != 0 {
+            let nb = name_bytes(lm.name(gperson[g]));
+            (nb.as_ptr(), nb.len())
         } else {
-            let (np, nl) = user_at(info >> 1);
-            name_buf.extend_from_slice(sl(np, nl));
+            user_at(info >> 1)
+        };
+        if !NAMECP {
+            name_buf.clear();
+            name_buf.extend_from_slice(sl(nptr, nlen));
         }
         let tq2 = if PHASE_FINE { tsc() } else { 0 };
         let _ = tq2 - tq1;
@@ -2280,8 +2298,24 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
         }
         macro_rules! flush {
             () => {
-                out.names.extend_from_slice(&(name_buf.len() as u32).to_le_bytes());
-                out.names.extend_from_slice(&name_buf);
+                if NAMECP {
+                    // length and a fixed 32-byte copy (the input stays readable 32 bytes past any name)
+                    let len0 = out.names.len();
+                    if out.names.capacity() - len0 < 36 + nlen {
+                        out.names.reserve(36 + nlen + (len0 >> 1).max(1 << 16));
+                    }
+                    let d = out.names.as_mut_ptr().add(len0);
+                    (d as *mut u32).write_unaligned(nlen as u32);
+                    if nlen <= 32 {
+                        _mm256_storeu_si256(d.add(4) as *mut __m256i, _mm256_loadu_si256(nptr as *const __m256i));
+                    } else {
+                        std::ptr::copy_nonoverlapping(nptr, d.add(4), nlen);
+                    }
+                    out.names.set_len(len0 + 4 + nlen);
+                } else {
+                    out.names.extend_from_slice(&(name_buf.len() as u32).to_le_bytes());
+                    out.names.extend_from_slice(&name_buf);
+                }
                 out.day.push(day_base as i32 + cur_day as i32);
                 out.sessions.push(r_sessions);
                 out.events.push(r_events);
@@ -3665,7 +3699,11 @@ fn main() {
                             };
                         }
                         if EVFN && !SCANNL && !DIAG {
-                            ev_lines(&evcx, &mut wc1, evb, s, c.b, c.fe);
+                            if strict {
+                                ev_lines::<true>(&evcx, &mut wc1, evb, s, c.b, c.fe);
+                            } else {
+                                ev_lines::<false>(&evcx, &mut wc1, evb, s, c.b, c.fe);
+                            }
                             s = c.b;
                         }
                         if !SCANNL && !(EVFN && !DIAG) {
@@ -3835,7 +3873,11 @@ fn main() {
                                 }
                             };
                             let cx = CkCtx { camp_tab, lm: l, base_ms, we, q, strict };
-                            ck_lines(&cx, &mut wcc2, c2, &mut cring, &mut crn, s, c.b, c.fe);
+                            if strict {
+                                ck_lines::<true>(&cx, &mut wcc2, c2, &mut cring, &mut crn, s, c.b, c.fe);
+                            } else {
+                                ck_lines::<false>(&cx, &mut wcc2, c2, &mut cring, &mut crn, s, c.b, c.fe);
+                            }
                             s = c.b;
                         }
                         if !SCANNL {
