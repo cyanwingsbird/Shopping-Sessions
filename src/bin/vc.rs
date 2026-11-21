@@ -936,12 +936,18 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     k
 }
 const SCAN: usize = 1 << 16;
+/// stage-2 partitions in a function of their own
+const S2FN: bool = false;
+/// stage-1 click lines (direct mode) in a function of their own
+const CKFN: bool = true;
+/// stage-3 ts radix on bits 8.. only (3 passes) plus a per-person insertion fix-up
+const R3FIX: bool = false;
 /// stage-1 event lines in a function of their own
 const EVFN: bool = true;
 /// stage-2 dedup: bitmap prefilter, exact table only for possible copies
 const DEDUPBM: bool = false;
 /// stage 3: partitions of at least SUB3MIN events are split into SUB3 pieces by person hash
-const SUB3: usize = 2;
+const SUB3: usize = 4;
 const SUB3MIN: usize = 32768;
 /// stage-2 scatter: staging-slot prefetch distance (0 = none)
 const PFW: usize = 0;
@@ -1529,6 +1535,327 @@ unsafe fn ev_lines(cx: &EvCtx, wc1: &mut Wc<Rec, WC1K>, evb: &mut [Vec<Rec>], mu
             ev_body!(p, line_at, fld);
         }
     }
+    std::hint::black_box(abl_sink);
+}
+
+
+/// Stage 1, click lines starting in [s, cb) (file end fe) once the links are ready: parse, validate,
+/// map to the person (CRING clicks after the link-table prefetch) and stage by person partition.
+struct CkCtx<'a> {
+    camp_tab: &'a IdTab,
+    lm: &'a LinkMap,
+    base_ms: i64,
+    we: i64,
+    q: usize,
+    strict: bool,
+}
+#[inline(never)]
+unsafe fn ck_lines(cx: &CkCtx, wcc2: &mut Wc<RecC, 8>, c2: &mut [Vec<RecC>], cring: &mut [RecC; CRING], crn: &mut usize, mut s: usize, cb: usize, fe: usize) {
+    let CkCtx { camp_tab, lm, base_ms, we, q, strict } = *cx;
+    let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
+    while s < cb {
+        let line = s;
+        let p = base().add(line);
+        let sp = if strict { Sp4 { kind: 2, ..Default::default() } } else { split_ck4f(p, fe - line) };
+        let (r, fs) = if sp.kind == 0 {
+            s = line + sp.len as usize + 1;
+            (1u32, [sp.field(0), sp.field(1), sp.field(2), sp.field(3)])
+        } else if sp.kind == 1 {
+            s = line + sp.len as usize + 1;
+            continue;
+        } else {
+            let (len, r) = split_ev::<4>(strict, p, fe - line, &mut st, &mut en);
+            s = line + len + 1;
+            let qd = r == 2;
+            (r, [fldq(p, &st, &en, 0, qd), fldq(p, &st, &en, 1, qd), fldq(p, &st, &en, 2, qd), fldq(p, &st, &en, 3, qd)])
+        };
+        let ((_f0, l0), (f1, l1), (f2, l2), (f3, l3)) = (fs[0], fs[1], fs[2], fs[3]);
+        if r == 0 || l0 == 0 || l1 == 0 {
+            continue;
+        }
+        let uh = hash(p.add(f1), l1);
+        lm.prefetch(uh);
+        let t = parse_ts_fast(p.add(f3), l3);
+        if t < base_ms || t >= we {
+            continue;
+        }
+        let camp = match camp_tab.get(p.add(f2), l2) {
+            Some(c) => c,
+            None => continue,
+        };
+        let rc = RecC { user: uh, pc: ((line as u64) << 16) | camp as u64, ts: (t - base_ms) as u32, kh: 0 };
+        let mut d = std::mem::replace(cring.get_unchecked_mut(*crn & (CRING - 1)), rc);
+        *crn += 1;
+        if *crn > CRING {
+            d.user = lm.map(d.user).0;
+            let part = (((d.user >> 32) * q as u64) >> 32) as usize;
+            wcc2.push(c2, part, d);
+        }
+    }
+}
+
+
+/// Stage 2, one event_id partition: dedup (losing copies get ts = DEAD), persons, scatter by person.
+/// A function of its own, so that its loops get the registers to themselves.
+struct S2Buf {
+    table: Vec<u64>,
+    table32: Vec<u32>,
+    bm1: Vec<u64>,
+    bm2: Vec<u64>,
+    cand: Vec<*mut Rec>,
+}
+#[inline(never)]
+unsafe fn s2_part(slices: &[(*mut Rec, usize)], bufs: &mut S2Buf, lm: &LinkMap, has_links: bool, wc2: &mut WcB<WC2K>, e2: &mut [BlkVec], pool: &mut Pool, q: usize, ph: &mut [u64; 8]) {
+    let S2Buf { table, table32, bm1, bm2, cand } = bufs;
+    let abl = 0usize;
+    let mut abl_sink = 0u64;
+    let pool = &mut *pool;
+    let ta = tsc();
+    let n: usize = slices.iter().map(|s| s.1).sum();
+    let cap = (n * 2).next_power_of_two().max(16);
+    let mask = cap - 1;
+    if n >= (1 << 20) - 1 {
+        table.clear();
+        table.resize(cap, 0);
+    }
+    let resolve = |gi: usize| -> *mut Rec {
+        let mut g = gi;
+        for s in slices.iter() {
+            if g < s.1 {
+                return s.0.add(g);
+            }
+            g -= s.1;
+        }
+        unreachable!()
+    };
+    let mut gi = 0usize;
+    if DEDUPBM && n < (1 << 20) - 1 {
+        // two bitmaps (seen, seen twice) over 20 bits of the hash pick out the records that
+        // may have a copy; only those go through the exact table
+        let nbits = (n * 8).next_power_of_two().max(512);
+        let bmk = nbits - 1;
+        bm1.clear();
+        bm1.resize(nbits / 64, 0);
+        bm2.clear();
+        bm2.resize(nbits / 64, 0);
+        for s in slices.iter() {
+            for i in 0..s.1 {
+                let b = ((*s.0.add(i)).eh >> 20) as usize & bmk;
+                let (w, m) = (b >> 6, 1u64 << (b & 63));
+                let x = *bm1.get_unchecked(w);
+                *bm2.get_unchecked_mut(w) |= x & m;
+                *bm1.get_unchecked_mut(w) = x | m;
+            }
+        }
+        cand.clear();
+        for s in slices.iter() {
+            for i in 0..s.1 {
+                let r = s.0.add(i);
+                let b = ((*r).eh >> 20) as usize & bmk;
+                if (*bm2.get_unchecked(b >> 6) >> (b & 63)) & 1 != 0 {
+                    cand.push(r);
+                }
+            }
+        }
+        let nb = (cand.len() / 8).next_power_of_two().max(1);
+        let bmask = nb - 1;
+        table32.clear();
+        table32.resize(nb * 16 + 16, 0);
+        let tb = ((table32.as_mut_ptr() as usize + 63) & !63) as *mut u32;
+        for ci in 0..cand.len() {
+            let r = &mut **cand.get_unchecked(ci);
+            let tag = ((r.eh >> 32) & 0xFFF) as u32;
+            let t = _mm256_set1_epi32(tag as i32);
+            let z = _mm256_setzero_si256();
+            let mut b = r.eh as usize & bmask;
+            'probe2: loop {
+                let p = tb.add(b * 16);
+                let v0 = _mm256_load_si256(p as *const __m256i);
+                let v1 = _mm256_load_si256(p.add(8) as *const __m256i);
+                let e0 = _mm256_cmpeq_epi32(v0, z);
+                let e1 = _mm256_cmpeq_epi32(v1, z);
+                let m0 = _mm256_andnot_si256(e0, _mm256_cmpeq_epi32(_mm256_srli_epi32::<20>(v0), t));
+                let m1 = _mm256_andnot_si256(e1, _mm256_cmpeq_epi32(_mm256_srli_epi32::<20>(v1), t));
+                let mut mt = (_mm256_movemask_ps(_mm256_castsi256_ps(m0)) as u32) | ((_mm256_movemask_ps(_mm256_castsi256_ps(m1)) as u32) << 8);
+                let em = (_mm256_movemask_ps(_mm256_castsi256_ps(e0)) as u32) | ((_mm256_movemask_ps(_mm256_castsi256_ps(e1)) as u32) << 8);
+                while mt != 0 {
+                    let j = mt.trailing_zeros() as usize;
+                    mt &= mt - 1;
+                    let e = *p.add(j);
+                    let o = &mut **cand.get_unchecked(((e & 0xF_FFFF) - 1) as usize);
+                    if o.eh == r.eh {
+                        if (r.ic >> 8) < (o.ic >> 8) {
+                            o.ts = DEAD;
+                            *p.add(j) = (tag << 20) | (ci as u32 + 1);
+                        } else {
+                            r.ts = DEAD;
+                        }
+                        break 'probe2;
+                    }
+                }
+                if em != 0 {
+                    *p.add(em.trailing_zeros() as usize) = (tag << 20) | (ci as u32 + 1);
+                    break;
+                }
+                b = (b + 1) & bmask;
+            }
+        }
+        let _ = &mut gi;
+    } else if n < (1 << 20) - 1 {
+        // compact table: 16-slot buckets (one 64-byte line) of 12-bit tag << 20 | record
+        // index + 1; a lookup compares the whole bucket at once (no data-dependent branches
+        // unless a tag matches or the bucket is full)
+        let nb = (n / 8).next_power_of_two().max(1);
+        let bmask = nb - 1;
+        table32.clear();
+        table32.resize(nb * 16 + 16, 0);
+        let tb = ((table32.as_mut_ptr() as usize + 63) & !63) as *mut u32;
+        for s in slices.iter() {
+            if DIAG && abl == 6 {
+                break;
+            }
+            for i in 0..s.1 {
+                if PFD2 > 0 && i + PFD2 < s.1 {
+                    let e2h = (*s.0.add(i + PFD2)).eh;
+                    _mm_prefetch(tb.add((e2h as usize & bmask) * 16) as *const i8, _MM_HINT_T0);
+                }
+                let r = &mut *s.0.add(i);
+                let tag = ((r.eh >> 32) & 0xFFF) as u32;
+                let t = _mm256_set1_epi32(tag as i32);
+                let z = _mm256_setzero_si256();
+                let mut b = r.eh as usize & bmask;
+                'probe: loop {
+                    let p = tb.add(b * 16);
+                    let v0 = _mm256_load_si256(p as *const __m256i);
+                    let v1 = _mm256_load_si256(p.add(8) as *const __m256i);
+                    let e0 = _mm256_cmpeq_epi32(v0, z);
+                    let e1 = _mm256_cmpeq_epi32(v1, z);
+                    let m0 = _mm256_andnot_si256(e0, _mm256_cmpeq_epi32(_mm256_srli_epi32::<20>(v0), t));
+                    let m1 = _mm256_andnot_si256(e1, _mm256_cmpeq_epi32(_mm256_srli_epi32::<20>(v1), t));
+                    let mut mt = (_mm256_movemask_ps(_mm256_castsi256_ps(m0)) as u32) | ((_mm256_movemask_ps(_mm256_castsi256_ps(m1)) as u32) << 8);
+                    let em = (_mm256_movemask_ps(_mm256_castsi256_ps(e0)) as u32) | ((_mm256_movemask_ps(_mm256_castsi256_ps(e1)) as u32) << 8);
+                    while mt != 0 {
+                        let j = mt.trailing_zeros() as usize;
+                        mt &= mt - 1;
+                        let e = *p.add(j);
+                        let o = &mut *resolve(((e & 0xF_FFFF) - 1) as usize);
+                        if o.eh == r.eh {
+                            if (r.ic >> 8) < (o.ic >> 8) {
+                                o.ts = DEAD;
+                                *p.add(j) = (tag << 20) | (gi as u32 + 1);
+                            } else {
+                                r.ts = DEAD;
+                            }
+                            break 'probe;
+                        }
+                    }
+                    if em != 0 {
+                        *p.add(em.trailing_zeros() as usize) = (tag << 20) | (gi as u32 + 1);
+                        break;
+                    }
+                    b = (b + 1) & bmask;
+                }
+                gi += 1;
+            }
+        }
+    } else {
+        for s in slices.iter() {
+            if DIAG && abl == 6 { break; }
+            for i in 0..s.1 {
+                let r = &mut *s.0.add(i);
+                let h24 = r.eh & 0xFFFF_FFFF;
+                let mut idx = h24 as usize & mask;
+                loop {
+                    let e = *table.get_unchecked(idx);
+                    if e == 0 {
+                        *table.get_unchecked_mut(idx) = (h24 << 32) | (gi as u64 + 1);
+                        break;
+                    }
+                    if e >> 32 == h24 {
+                        let o = &mut *resolve((e as u32 - 1) as usize);
+                        if o.eh == r.eh {
+                            if (r.ic >> 8) < (o.ic >> 8) {
+                                o.ts = DEAD;
+                                *table.get_unchecked_mut(idx) = (h24 << 32) | (gi as u64 + 1);
+                            } else {
+                                r.ts = DEAD;
+                            }
+                            break;
+                        }
+                    }
+                    idx = (idx + 1) & mask;
+                }
+                gi += 1;
+            }
+        }
+
+    }
+    let tb = tsc();
+    ph[0] += tb - ta;
+    if MAP2 && has_links {
+        // persons first (link-table lookups only), then the scatter (write-combining
+        // buffers only): the two working sets do not compete for the cache
+        for s in slices.iter() {
+            let recs = std::slice::from_raw_parts_mut(s.0, s.1);
+            for i in 0..recs.len() {
+                // filter word 2*PF2 records ahead, the table line PF2 ahead
+                if i + 2 * PF2 < recs.len() {
+                    let k = recs.get_unchecked(i + 2 * PF2).user;
+                    let fi = (k >> 32) as usize & lm.fmask;
+                    _mm_prefetch(lm.filt.as_ptr().add(fi >> 6) as *const i8, _MM_HINT_T0);
+                }
+                if i + PF2 < recs.len() {
+                    lm.prefetch(recs.get_unchecked(i + PF2).user);
+                }
+                let r = recs.get_unchecked_mut(i);
+                let (pu, linked) = lm.map(r.user);
+                r.eh = pu;
+                r.user = linked as u64;
+            }
+        }
+        for s in slices.iter() {
+            let recs = std::slice::from_raw_parts(s.0, s.1);
+            for i in 0..recs.len() {
+                if PFW > 0 && i + PFW < recs.len() {
+                    let pu = recs.get_unchecked(i + PFW).eh;
+                    wc2.prefetch((((pu >> 32) * q as u64) >> 32) as usize);
+                }
+                let r = recs.get_unchecked(i);
+                if r.ts >= 0x8000_0000 {
+                    continue;
+                }
+                let o = Rec2 { user: r.eh, pos: ((r.pp >> 24) << 1) | r.user, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
+                let part = (((o.user >> 32) * q as u64) >> 32) as usize;
+                if DIAG && abl == 7 { abl_sink += o.user; continue; }
+                wc2.push(e2, pool, part, o);
+            }
+        }
+    }
+    for s in slices.iter() {
+        if MAP2 && has_links {
+            break;
+        }
+        let recs = std::slice::from_raw_parts(s.0, s.1);
+        for i in 0..recs.len() {
+            if has_links && i + 24 < recs.len() {
+                lm.prefetch(recs.get_unchecked(i + 24).user);
+            }
+            let r = recs.get_unchecked(i);
+            if r.ts >= 0x8000_0000 {
+                continue;
+            }
+            let mut o = Rec2 { user: r.user, pos: (r.pp >> 24) << 1, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
+            if has_links {
+                let (pu, linked) = lm.map(r.user);
+                o.user = pu;
+                o.pos |= linked as u64;
+            }
+            let part = (((o.user >> 32) * q as u64) >> 32) as usize;
+            if DIAG && abl == 7 { abl_sink += o.user; continue; }
+            wc2.push(e2, pool, part, o);
+        }
+    }
+    ph[1] += tsc() - tb;
     std::hint::black_box(abl_sink);
 }
 
@@ -2932,6 +3259,22 @@ fn main() {
                             });
                             };
                         }
+                        if CKFN && ck_direct && !SCANNL {
+                            let l = match lm1 {
+                                Some(l) => l,
+                                None => {
+                                    while !links_ready.load(std::sync::atomic::Ordering::Acquire) {
+                                        std::hint::spin_loop();
+                                    }
+                                    let l: &LinkMap = linkmap.get();
+                                    lm1 = Some(l);
+                                    l
+                                }
+                            };
+                            let cx = CkCtx { camp_tab, lm: l, base_ms, we, q, strict };
+                            ck_lines(&cx, &mut wcc2, c2, &mut cring, &mut crn, s, c.b, c.fe);
+                            s = c.b;
+                        }
                         if !SCANNL {
                             while s < c.b {
                                 let line = s;
@@ -3015,6 +3358,7 @@ fn main() {
                 let mut pool = Pool { free: Vec::new(), cur: 0, end: 0 };
                 let mut table: Vec<u64> = Vec::new();
                 let mut table32: Vec<u32> = Vec::new();
+                let mut s2buf = S2Buf { table: Vec::new(), table32: Vec::new(), bm1: Vec::new(), bm2: Vec::new(), cand: Vec::new() };
                 let mut bm1: Vec<u64> = Vec::new();
                 let mut bm2: Vec<u64> = Vec::new();
                 let mut cand: Vec<*mut Rec> = Vec::new();
@@ -3032,6 +3376,9 @@ fn main() {
                                 (v.as_mut_ptr(), v.len())
                             })
                             .collect();
+                        if S2FN && !DIAG {
+                            s2_part(&slices, &mut s2buf, lm, has_links, &mut wc2, e2, &mut pool, q, &mut ph);
+                        } else {
                         let ta = tsc();
                         let n: usize = slices.iter().map(|s| s.1).sum();
                         let cap = (n * 2).next_power_of_two().max(16);
@@ -3278,6 +3625,7 @@ fn main() {
                             }
                         }
                         ph[1] += tsc() - tb;
+                        }
                         if RECYCLE {
                             // the partition's stage-1 records are consumed: their memory becomes blocks
                             for t in 0..nthreads {
@@ -3597,7 +3945,8 @@ fn main() {
                         }
                         let (mut sv, mut sg) = (vals.as_mut_ptr(), gids.as_mut_ptr());
                         let (mut dv, mut dg) = (rv2.as_mut_ptr(), rg2.as_mut_ptr());
-                        for pass in 0..4usize {
+                        let p0 = if R3FIX { 1 } else { 0 };
+                        for pass in p0..4usize {
                             let shift = 32 + 8 * pass as u32;
                             let h = &mut cnt[pass];
                             for i in 0..n {
@@ -3610,6 +3959,11 @@ fn main() {
                             }
                             std::mem::swap(&mut sv, &mut dv);
                             std::mem::swap(&mut sg, &mut dg);
+                        }
+                        if R3FIX {
+                            // three passes (ms / 256): the data is in rv2/rg2; each person is fixed up below
+                            std::mem::swap(&mut vals, &mut rv2);
+                            std::mem::swap(&mut gids, &mut rg2);
                         }
                         // four passes: the sorted data is back in vals/gids
                         }
@@ -3778,6 +4132,20 @@ fn main() {
                         }
                         let tq2 = if PHASE_FINE { tsc() } else { 0 };
                         let _ = tq2 - tq1;
+                        if R3FIX && RADIX3 {
+                            // events sorted by ts / 256 ms: put the rare out-of-order neighbours right
+                            for i in 1..ev.len() {
+                                let v = *ev.get_unchecked(i);
+                                if v < *ev.get_unchecked(i - 1) {
+                                    let mut j = i;
+                                    while j > 0 && *ev.get_unchecked(j - 1) > v {
+                                        *ev.get_unchecked_mut(j) = *ev.get_unchecked(j - 1);
+                                        j -= 1;
+                                    }
+                                    *ev.get_unchecked_mut(j) = v;
+                                }
+                            }
+                        }
                         let n = ev.len();
                         let nck = ck.len();
                         let (mut lo, mut hi) = (0usize, 0usize);
