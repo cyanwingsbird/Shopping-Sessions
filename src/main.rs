@@ -1016,7 +1016,7 @@ const ASSIST_IV: bool = true;
 /// stage 2: link lookups and scatter in two passes over each partition
 const MAP2: bool = true;
 /// stage 2: the link lookups ride along in the dedup pass (compact-table path)
-const FUSE2: bool = true;
+const FUSE2: bool = false;
 /// per-person sub-phases in the SS_TIMING report
 const PHASE_FINE: bool = false;
 /// stage 3: radix-sort each partition's clicks by ts instead of sorting each person's clicks
@@ -1739,7 +1739,9 @@ unsafe fn ck_lines<const STRICT: bool>(cx: &CkCtx, wcc2: &mut Wc<RecC, 8>, c2: &
             continue;
         }
         let uh = hash(p.add(f1), l1);
-        lm.prefetch(uh);
+        // the link-table bucket is found once: prefetched now, read CRING clicks later
+        let (bp0, bit0, bi0) = lm.bucket_ptr(uh);
+        _mm_prefetch(bp0 as *const i8, _MM_HINT_T0);
         let t = parse_ts_fast(p.add(f3), l3);
         if t < base_ms || t >= we {
             continue;
@@ -1748,11 +1750,14 @@ unsafe fn ck_lines<const STRICT: bool>(cx: &CkCtx, wcc2: &mut Wc<RecC, 8>, c2: &
             Some(c) => c,
             None => continue,
         };
-        let rc = RecC { user: uh, pc: ((line as u64) << 16) | camp as u64, ts: (t - base_ms) as u32, kh: 0 };
+        let rc = RecC { user: uh, pc: ((line as u64) << 16) | camp as u64, ts: (t - base_ms) as u32, kh: ((bi0 as u32) << 1) | bit0 as u32 };
         let mut d = std::mem::replace(cring.get_unchecked_mut(*crn & (CRING - 1)), rc);
         *crn += 1;
         if *crn > CRING {
-            d.user = lm.map(d.user).0;
+            let (bi, bit) = ((d.kh >> 1) as usize, (d.kh & 1) as u64);
+            let bp = if bit != 0 { lm.slots.as_ptr().add(bi) } else { &lm.empty as *const LBucket };
+            d.user = lm.map_at(d.user, bp, bit, bi).0;
+            d.kh = 0;
             let part = (((d.user >> 32) * q as u64) >> 32) as usize;
             wcc2.push(c2, part, d);
         }
@@ -4400,6 +4405,7 @@ fn main() {
                         for k in crn.saturating_sub(CRING)..crn {
                             let mut d = cring[k & (CRING - 1)];
                             d.user = l.map(d.user).0;
+                            d.kh = 0;
                             let part = (((d.user >> 32) * q as u64) >> 32) as usize;
                             wcc2.push(c2, part, d);
                         }
