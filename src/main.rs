@@ -1278,6 +1278,45 @@ fn main() {
         )
     };
     init_daytab();
+    if let Ok(src) = std::env::var("SS_EMIT_TEXT") {
+        // diagnostic: each TSV line "user_id day sessions events revenue top" becomes a user_daily row
+        let text = std::fs::read_to_string(&src).unwrap_or_default();
+        let rows: Vec<Vec<&str>> = text.lines().filter(|l| !l.is_empty()).map(|l| l.split('\t').collect()).collect();
+        let n = rows.len();
+        let num = |r: &Vec<&str>, i: usize| -> i64 { r.get(i).and_then(|x| x.trim().parse::<f64>().ok()).unwrap_or(0.0) as i64 };
+        let mut names = Vec::new();
+        let mut cats = Vec::new();
+        let (mut day, mut ses, mut evn, mut rev) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for r in &rows {
+            let id = r[0].as_bytes();
+            names.extend_from_slice(&(id.len() as u32).to_le_bytes());
+            names.extend_from_slice(id);
+            day.push(num(r, 1) as i32);
+            ses.push(num(r, 2) as i32);
+            evn.push(num(r, 3) as i32);
+            rev.push(num(r, 4));
+            let c = r.get(5).copied().unwrap_or("").as_bytes();
+            cats.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            cats.extend_from_slice(c);
+        }
+        let groups = n.div_ceil(8);
+        let mut defl: Vec<u8> = Vec::new();
+        let mut hdr = Th::new();
+        hdr.varint(((groups as u64) << 1) | 1);
+        defl.extend_from_slice(&((hdr.b.len() + groups) as u32).to_le_bytes());
+        defl.extend_from_slice(&hdr.b);
+        defl.extend_from_slice(&vec![0xFFu8; groups]);
+        let cols = [
+            Col { name: "user_id", ptype: 6, conv: 0, optional: false, parts: vec![&names] },
+            Col { name: "day", ptype: 1, conv: 6, optional: false, parts: vec![as_bytes(&day)] },
+            Col { name: "sessions", ptype: 1, conv: -1, optional: false, parts: vec![as_bytes(&ses)] },
+            Col { name: "events", ptype: 1, conv: -1, optional: false, parts: vec![as_bytes(&evn)] },
+            Col { name: "revenue_cents", ptype: 2, conv: -1, optional: false, parts: vec![as_bytes(&rev)] },
+            Col { name: "top_category", ptype: 6, conv: 0, optional: true, parts: vec![&defl, &cats] },
+        ];
+        write_parquet(&args[args.len() - 1], n, &cols);
+        return;
+    }
     if std::env::var("SS_SELFTEST").is_ok() {
         selftest();
         return;
