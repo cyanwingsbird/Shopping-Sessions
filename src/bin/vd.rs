@@ -961,7 +961,7 @@ const EVFN: bool = true;
 const DEDUPBM: bool = false;
 /// stage 3: partitions of at least SUB3MIN events are split into SUB3 pieces by person hash
 const SUB3: usize = 4;
-const SUB3MIN: usize = 32768;
+const SUB3MIN: usize = 8192;
 /// stage-2 scatter: staging-slot prefetch distance (0 = none)
 const PFW: usize = 0;
 /// stage-3 grouping: hash-slot prefetch distance (0 = none)
@@ -977,7 +977,7 @@ const CRING: usize = 8;
 /// SS_ABL ablations (diagnostic builds only)
 const DIAG: bool = false;
 /// records per partition staged before a streaming write in stage 1 (32-byte records)
-const WC1K: usize = 8;
+const WC1K: usize = 4;
 /// stage-2 output blocks recycled from consumed stage-1 memory
 const RECYCLE: bool = true;
 /// stage 3 ts radix: 3 passes of 11 bits (else 4 of 8)
@@ -1008,6 +1008,8 @@ const RELEASE: bool = true;
 const NAMECP: bool = true;
 /// stage 1: ISO ts with an offset parsed with ingest_ts in the same SIMD pass as the Z form
 const ISOM: bool = true;
+/// stage 2: persons of a partition kept in a side array (stage-1 records not written)
+const PMAP: bool = true;
 /// stage 3: radix-sort each partition by ts instead of sorting each person's events
 const RADIX3: bool = true;
 const HIST: bool = false;
@@ -1641,10 +1643,12 @@ struct S2Buf {
     bm1: Vec<u64>,
     bm2: Vec<u64>,
     cand: Vec<*mut Rec>,
+    pmap: Vec<u64>,
+    plk: Vec<u8>,
 }
 #[inline(never)]
 unsafe fn s2_part(slices: &[(*mut Rec, usize)], bufs: &mut S2Buf, lm: &LinkMap, has_links: bool, wc2: &mut WcB<WC2K>, e2: &mut [BlkVec], pool: &mut Pool, q: usize, ph: &mut [u64; 8]) {
-    let S2Buf { table, table32, bm1, bm2, cand } = bufs;
+    let S2Buf { table, table32, bm1, bm2, cand, pmap, plk } = bufs;
     let abl = 0usize;
     let mut abl_sink = 0u64;
     let pool = &mut *pool;
@@ -1830,7 +1834,47 @@ unsafe fn s2_part(slices: &[(*mut Rec, usize)], bufs: &mut S2Buf, lm: &LinkMap, 
     }
     let tb = tsc();
     ph[0] += tb - ta;
-    if MAP2 && has_links {
+    if PMAP && MAP2 && has_links {
+        // as below, but the persons go to a side array (the records stay clean: no write-back)
+        pmap.clear();
+        pmap.reserve(n);
+        plk.clear();
+        plk.reserve(n);
+        let pm = pmap.as_mut_ptr();
+        let pk = plk.as_mut_ptr();
+        let mut k0 = 0usize;
+        for s in slices.iter() {
+            let recs = std::slice::from_raw_parts(s.0, s.1);
+            for i in 0..recs.len() {
+                if i + 2 * PF2 < recs.len() {
+                    let k = recs.get_unchecked(i + 2 * PF2).user;
+                    let fi = (k >> 32) as usize & lm.fmask;
+                    _mm_prefetch(lm.filt.as_ptr().add(fi >> 6) as *const i8, _MM_HINT_T0);
+                }
+                if i + PF2 < recs.len() {
+                    lm.prefetch(recs.get_unchecked(i + PF2).user);
+                }
+                let (pu, linked) = lm.map(recs.get_unchecked(i).user);
+                *pm.add(k0 + i) = pu;
+                *pk.add(k0 + i) = linked as u8;
+            }
+            k0 += s.1;
+        }
+        let mut k0 = 0usize;
+        for s in slices.iter() {
+            let recs = std::slice::from_raw_parts(s.0, s.1);
+            for i in 0..recs.len() {
+                let r = recs.get_unchecked(i);
+                if r.ts >= 0x8000_0000 {
+                    continue;
+                }
+                let o = Rec2 { user: *pm.add(k0 + i), pos: ((r.pp >> 24) << 1) | *pk.add(k0 + i) as u64, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
+                let part = (((o.user >> 32) * q as u64) >> 32) as usize;
+                wc2.push(e2, pool, part, o);
+            }
+            k0 += s.1;
+        }
+    } else if MAP2 && has_links {
         // persons first (link-table lookups only), then the scatter (write-combining
         // buffers only): the two working sets do not compete for the cache
         for s in slices.iter() {
@@ -3982,7 +4026,7 @@ fn main() {
                 let mut pool = Pool { free: Vec::new(), cur: 0, end: 0 };
                 let mut table: Vec<u64> = Vec::new();
                 let mut table32: Vec<u32> = Vec::new();
-                let mut s2buf = S2Buf { table: Vec::new(), table32: Vec::new(), bm1: Vec::new(), bm2: Vec::new(), cand: Vec::new() };
+                let mut s2buf = S2Buf { table: Vec::new(), table32: Vec::new(), bm1: Vec::new(), bm2: Vec::new(), cand: Vec::new(), pmap: Vec::new(), plk: Vec::new() };
                 let mut bm1: Vec<u64> = Vec::new();
                 let mut bm2: Vec<u64> = Vec::new();
                 let mut cand: Vec<*mut Rec> = Vec::new();
