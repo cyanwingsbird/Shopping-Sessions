@@ -1,0 +1,5 @@
+target/
+out/
+out20/
+__pycache__/
+_upload/
