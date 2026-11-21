@@ -826,9 +826,11 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     }
     k
 }
-const SCAN: usize = 1 << 14;
+const SCAN: usize = 1 << 16;
 /// stage 3: radix-sort each partition by ts instead of sorting each person's events
-const RADIX3: bool = true;
+const RADIX3: bool = false;
+/// diagnostic: time the sorts and the name fetch inside stage 3's per-person loop
+const PHASE_FINE: bool = false;
 
 #[derive(Default, Clone, Copy)]
 struct Sp7 {
@@ -1243,6 +1245,10 @@ impl LinkMap {
             }
             i = (i + 1) & self.nmask;
         }
+    }
+    #[inline(always)]
+    unsafe fn prefetch_name(&self, k: u64) {
+        _mm_prefetch(self.names.as_ptr().add(k as usize & self.nmask) as *const i8, _MM_HINT_T0);
     }
     #[inline(always)]
     unsafe fn prefetch(&self, k: u64) {
@@ -2091,6 +2097,9 @@ fn main() {
     let ev1: Vec<Sh<Vec<Vec<Rec>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let ck1: Vec<Sh<Vec<Vec<RecC>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let ev2: Vec<Sh<Vec<Vec<Rec2>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
+    // tombstones: an emitted event that a later-read copy with a smaller ingest_ts displaced (stage 3
+    // removes one event with the same person, ts, price and category)
+    let tomb: Vec<Sh<Vec<Vec<Rec2>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let ck2: Vec<Sh<Vec<Vec<RecC>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let cells: Vec<Sh<Vec<Cell>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let assists: Vec<Sh<Vec<u32>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
@@ -2108,6 +2117,7 @@ fn main() {
     std::thread::scope(|sc| {
         for tid in 0..nthreads {
             let (chunks, ev1, ck1, ev2, ck2, cells, linkmap, assists) = (&chunks, &ev1, &ck1, &ev2, &ck2, &cells, &linkmap, &assists);
+            let tomb = &tomb;
             let (next_chunk, next_p1, next_q, barrier) = (&next_chunk, &next_p1, &next_q, &barrier);
             let (prod_tab, camp_tab, ln_segs, cat_names, cat_rank, out_dir) = (&prod_tab, &camp_tab, &ln_segs, &cat_names, &cat_rank, &out_dir);
             let body = move || unsafe {
@@ -2361,10 +2371,12 @@ fn main() {
                 let e2 = ev2[tid].get();
                 let c2 = ck2[tid].get();
                 *e2 = (0..q).map(|_| Vec::with_capacity(est_ev / (q * nthreads) * 5 / 4 + 64)).collect();
+                let t2 = tomb[tid].get();
+                *t2 = (0..q).map(|_| Vec::new()).collect();
                 *c2 = (0..q).map(|_| Vec::with_capacity(est_ck / (q * nthreads) * 5 / 4 + 64)).collect();
                 let mut table: Vec<u64> = Vec::new();
                 let mut table32: Vec<u32> = Vec::new();
-                let mut wc2: Wc<Rec2, 8> = Wc::new(q);
+                let mut wc2: Wc<Rec2, 4> = Wc::new(q);
                 let mut ph = [0u64; 8];
                 let mut wcc2: Wc<RecC, 8> = Wc::new(q);
                 loop {
@@ -2398,6 +2410,7 @@ fn main() {
                             unreachable!()
                         };
                         let mut gi = 0usize;
+                        let mut merged = false;
                         if n < (1 << 20) - 1 {
                             // compact table: 16-slot buckets (one 64-byte line) of 12-bit tag << 20 | record
                             // index + 1; a lookup compares the whole bucket at once (no data-dependent branches
@@ -2407,16 +2420,39 @@ fn main() {
                             table32.clear();
                             table32.resize(nb * 16 + 16, 0);
                             let tb = ((table32.as_mut_ptr() as usize + 63) & !63) as *mut u32;
+                            // one pass: dedup and emit together. A record is emitted when it is first seen (or
+                            // displaces the copy kept so far); a displaced, already emitted copy gets a tombstone.
+                            macro_rules! emit {
+                                ($r:expr, $tomb:expr) => {{
+                                    let r: &Rec = $r;
+                                    let mut o = Rec2 { user: r.user, pos: (r.pp >> 24) << 1, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
+                                    if has_links {
+                                        let (pu, linked) = lm.map(r.user);
+                                        o.user = pu;
+                                        o.pos |= linked as u64;
+                                    }
+                                    let part = (((o.user >> 32) * q as u64) >> 32) as usize;
+                                    if $tomb {
+                                        t2.get_unchecked_mut(part).push(o);
+                                    } else {
+                                        wc2.push(e2, part, o);
+                                    }
+                                }};
+                            }
                             for s in &slices {
                                 if abl == 6 {
                                     break;
                                 }
                                 for i in 0..s.1 {
+                                    if has_links && i + 24 < s.1 {
+                                        lm.prefetch((*s.0.add(i + 24)).user);
+                                    }
                                     let r = &mut *s.0.add(i);
                                     let tag = ((r.eh >> 32) & 0xFFF) as u32;
                                     let t = _mm256_set1_epi32(tag as i32);
                                     let z = _mm256_setzero_si256();
                                     let mut b = r.eh as usize & bmask;
+                                    let mut keep = true;
                                     'probe: loop {
                                         let p = tb.add(b * 16);
                                         let v0 = _mm256_load_si256(p as *const __m256i);
@@ -2434,10 +2470,14 @@ fn main() {
                                             let o = &mut *resolve(((e & 0xF_FFFF) - 1) as usize);
                                             if o.eh == r.eh {
                                                 if (r.ic >> 8) < (o.ic >> 8) {
+                                                    if o.ts < 0x8000_0000 {
+                                                        emit!(o, true);
+                                                    }
                                                     o.ts = DEAD;
                                                     *p.add(j) = (tag << 20) | (gi as u32 + 1);
                                                 } else {
                                                     r.ts = DEAD;
+                                                    keep = false;
                                                 }
                                                 break 'probe;
                                             }
@@ -2448,9 +2488,13 @@ fn main() {
                                         }
                                         b = (b + 1) & bmask;
                                     }
+                                    if keep && r.ts < 0x8000_0000 && abl != 7 {
+                                        emit!(r, false);
+                                    }
                                     gi += 1;
                                 }
                             }
+                            merged = true;
                         } else {
                             for s in &slices {
                                 if abl == 6 { break; }
@@ -2486,6 +2530,9 @@ fn main() {
                         let tb = tsc();
                         ph[0] += tb - ta;
                         for s in &slices {
+                            if merged {
+                                break;
+                            }
                             let recs = std::slice::from_raw_parts(s.0, s.1);
                             for i in 0..recs.len() {
                                 if has_links && i + 24 < recs.len() {
@@ -2600,6 +2647,7 @@ fn main() {
                 let mut gids: Vec<u32> = Vec::new();
                 let mut rtmp: Vec<u64> = Vec::new();
                 let mut rv2: Vec<u64> = Vec::new();
+                let mut elen: Vec<u32> = Vec::new();
                 let mut rg2: Vec<u32> = Vec::new();
                 let mut vals: Vec<u64> = Vec::new();
                 let mut cgids: Vec<u32> = Vec::new();
@@ -2739,6 +2787,29 @@ fn main() {
                         eoff[g] = eoff[g - 1];
                     }
                     eoff[0] = 0;
+                    // tombstones: drop one event with the same (ts, price, category) from the person
+                    elen.clear();
+                    elen.extend((0..ng).map(|g| eoff[g + 1] - eoff[g]));
+                    for t in 0..nthreads {
+                        for tr in tomb[t].get()[qi].iter() {
+                            let k = tr.user;
+                            let mut idx = k as usize & gt.mask;
+                            let g = loop {
+                                let kk = *gt.keys.get_unchecked(idx);
+                                if kk == k {
+                                    break *gt.vals.get_unchecked(idx) as usize;
+                                }
+                                assert!(kk != 0, "tombstone without its event");
+                                idx = (idx + 1) & gt.mask;
+                            };
+                            let v = ((tr.ts as u64) << 32) | tr.pc as u64;
+                            let a = eoff[g] as usize;
+                            let e = a + elen[g] as usize;
+                            let j = (a..e).find(|&j| evs[j] == v).expect("tombstone without its event");
+                            evs.copy_within(j + 1..e, j);
+                            elen[g] -= 1;
+                        }
+                    }
                     let t3b = tsc();
                     ph[3] += t3b - t3a;
                     // clicks
@@ -2793,7 +2864,28 @@ fn main() {
                     ph[4] += t3c - t3b;
                     // per person
                     for g in 0..ng {
-                        let ev = &mut evs[eoff[g] as usize..eoff[g + 1] as usize];
+                        // the name comes from a random spot of the input (and, for linked persons, the
+                        // names table first): prefetch a few persons ahead
+                        if g + 16 < ng {
+                            let i2 = *ginfo.get_unchecked(g + 16);
+                            if i2 & 1 != 0 {
+                                lm.prefetch_name(*gperson.get_unchecked(g + 16));
+                            } else {
+                                _mm_prefetch(base().add((i2 >> 1) as usize) as *const i8, _MM_HINT_T0);
+                            }
+                        }
+                        if g + 8 < ng {
+                            let i2 = *ginfo.get_unchecked(g + 8);
+                            if i2 & 1 != 0 {
+                                let loc = lm.name(*gperson.get_unchecked(g + 8));
+                                _mm_prefetch(base().add((loc >> 24) as usize) as *const i8, _MM_HINT_T0);
+                            }
+                        }
+                        if elen[g] == 0 {
+                            continue;
+                        }
+                        let tf0 = if PHASE_FINE { tsc() } else { 0 };
+                        let ev = &mut evs[eoff[g] as usize..(eoff[g] + elen[g]) as usize];
                         if RADIX3 {
                         } else if ev.len() > 1024 {
                             // big persons (whales, shared devices): stable LSD radix sort on ts
@@ -2812,6 +2904,7 @@ fn main() {
                                 })
                             });
                         }
+                        let tf1 = if PHASE_FINE { tsc() } else { 0 };
                         // name
                         let info = ginfo[g];
                         name_buf.clear();
@@ -2820,6 +2913,11 @@ fn main() {
                         } else {
                             let (np, nl) = field_at(info >> 1, 1);
                             name_buf.extend_from_slice(sl(np, nl));
+                        }
+                        if PHASE_FINE {
+                            let tf2 = tsc();
+                            ph[6] += tf1 - tf0;
+                            ph[7] += tf2 - tf1;
                         }
                         let n = ev.len();
                         let nck = ck.len();
@@ -3068,7 +3166,7 @@ fn main() {
     if timing {
         let el = t0.elapsed().as_secs_f64();
         let _ = el;
-        let names = ["dedup", "map", "clk2", "group", "clk3", "person"];
+        let names = ["dedup", "map", "clk2", "group", "clk3", "person", "psort", "pname"];
         let mut line = String::from("phases(Mcyc, all threads)");
         for (i, n) in names.iter().enumerate() {
             line.push_str(&format!(" {}={}", n, PHASE[i].load(Relaxed) / 1_000_000));

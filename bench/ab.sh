@@ -14,7 +14,7 @@ one() {
     function ms(x) { if (x ~ /ms$/) { sub(/ms$/, "", x); return x + 0 } if (x ~ /µs$/) return 0; sub(/s$/, "", x); return x * 1000 }
     /^stage1/ { s1 = ms($3) } /^stage2/ { s2 = ms($3) } /^stage3/ { s3 = ms($3) } /^total/ { us = $4 }
     /^phases/ { for (i = 3; i <= NF; i++) { split($i, kv, "="); ph = ph substr(kv[1], 1, 2) kv[2] "," } }
-    /^perf/ { ph = ph " " $0 }
+    /^perf/ { x = $0; gsub(/ /, "_", x); ph = ph "_" x }
     END { printf "%.0f/%.0f/%.0f/%s/%s", s1, s2 - s1, s3 - s2, us, ph }')
   b=$(date +%s%N)
   echo "$1 $(( (b - a) / 1000000 )) $r" >> "$S/runs.txt"
