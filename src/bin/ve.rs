@@ -1008,8 +1008,6 @@ const RELEASE: bool = true;
 const NAMECP: bool = true;
 /// stage 1: ISO ts with an offset parsed with ingest_ts in the same SIMD pass as the Z form
 const ISOM: bool = true;
-/// link build: all ids first, then the unions with the parent entries prefetched
-const LINK2: bool = false;
 /// MADV_WILLNEED on every input file at startup (serial; useless on the scorer's tmpfs)
 const WILLNEED: bool = false;
 /// stage-3 person table: initial capacity n / GTDIV slots (grows when half full)
@@ -1017,7 +1015,7 @@ const GTDIV: usize = 4;
 /// stage-3 ts radix on (ts, index) keys only; gid and price fetched by index when placing
 const RADIXK: bool = false;
 /// stage-2 dedup table: one 16-slot bucket per DDIV records (rounded up to a power of two)
-const DDIV: usize = 16;
+const DDIV: usize = 8;
 /// stage 1: user hash and type check before the timestamps (shorter live ranges)
 const EVORD: bool = true;
 /// stage 3: each person's clicks sorted on their own (insertion sort when few) instead of a partition radix
@@ -2831,40 +2829,14 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
             }
         }};
     }
-    // ids first (table probes prefetched), then the unions (parent entries prefetched): the two
-    // kinds of random access do not wait on each other
-    let mut pairs: Vec<(u32, u32)> = Vec::new();
-    if LINK2 {
-        pairs.reserve(raw.len());
-        for (i, l) in raw.iter().enumerate() {
-            if i + 8 < raw.len() {
-                let n = raw.get_unchecked(i + 8);
-                _mm_prefetch(sp.add(n.ha as usize & mask) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(sp.add(n.hb as usize & mask) as *const i8, _MM_HINT_T0);
-            }
-            let a = intern!(l.ha, l.la);
-            let b = intern!(l.hb, l.lb);
-            pairs.push((a, b));
+    for (i, l) in raw.iter().enumerate() {
+        if i + 8 < raw.len() {
+            let n = raw.get_unchecked(i + 8);
+            _mm_prefetch(sp.add(n.ha as usize & mask) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(sp.add(n.hb as usize & mask) as *const i8, _MM_HINT_T0);
         }
-    }
-    let npairs = if LINK2 { pairs.len() } else { raw.len() };
-    for i in 0..npairs {
-        let (a, b) = if LINK2 {
-            if i + 16 < npairs {
-                let (na, nb) = *pairs.get_unchecked(i + 16);
-                _mm_prefetch(parent.as_ptr().add(na as usize) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(parent.as_ptr().add(nb as usize) as *const i8, _MM_HINT_T0);
-            }
-            *pairs.get_unchecked(i)
-        } else {
-            let l = raw.get_unchecked(i);
-            if i + 8 < raw.len() {
-                let n = raw.get_unchecked(i + 8);
-                _mm_prefetch(sp.add(n.ha as usize & mask) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(sp.add(n.hb as usize & mask) as *const i8, _MM_HINT_T0);
-            }
-            (intern!(l.ha, l.la), intern!(l.hb, l.lb))
-        };
+        let a = intern!(l.ha, l.la);
+        let b = intern!(l.hb, l.lb);
         let pp = parent.as_mut_ptr();
         let mut ra = a;
         while *pp.add(ra as usize) != ra {

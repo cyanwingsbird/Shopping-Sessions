@@ -708,7 +708,7 @@ unsafe fn parse_price(p: *const u8, len: usize) -> u32 {
 }
 
 // ---------------------------------------------------------------- line splitting
-#[cfg(target_feature = "avx512bw")]
+#[cfg(any())]
 #[inline(always)]
 unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     let a = _mm512_loadu_si512(p as *const _);
@@ -718,7 +718,7 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
         _mm512_cmpeq_epi8_mask(a, _mm512_set1_epi8(b'"' as i8)),
     )
 }
-#[cfg(not(target_feature = "avx512bw"))]
+#[cfg(all())]
 #[inline(always)]
 unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     let a = _mm256_loadu_si256(p as *const __m256i);
@@ -1008,6 +1008,8 @@ const RELEASE: bool = true;
 const NAMECP: bool = true;
 /// stage 1: ISO ts with an offset parsed with ingest_ts in the same SIMD pass as the Z form
 const ISOM: bool = true;
+/// stage-3 assists: day block of each session kept, pdays ends with a sentinel
+const ASBLK: bool = true;
 /// link build: all ids first, then the unions with the parent entries prefetched
 const LINK2: bool = false;
 /// MADV_WILLNEED on every input file at startup (serial; useless on the scorer's tmpfs)
@@ -1015,7 +1017,7 @@ const WILLNEED: bool = false;
 /// stage-3 person table: initial capacity n / GTDIV slots (grows when half full)
 const GTDIV: usize = 4;
 /// stage-3 ts radix on (ts, index) keys only; gid and price fetched by index when placing
-const RADIXK: bool = true;
+const RADIXK: bool = false;
 /// stage-2 dedup table: one 16-slot bucket per DDIV records (rounded up to a power of two)
 const DDIV: usize = 8;
 /// stage 1: user hash and type check before the timestamps (shorter live ranges)
@@ -2056,6 +2058,7 @@ struct S3 {
     cpos: Vec<u32>,
     active: Vec<u32>,
     name_buf: Vec<u8>,
+    sblk: Vec<u32>,
 }
 struct S3Ctx<'a> {
     lm: &'a LinkMap,
@@ -2070,7 +2073,7 @@ struct S3Ctx<'a> {
 #[allow(unused_mut, unused_variables)]
 unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &mut S3, out: &mut UOut, cell: &mut [Cell], asst_cells: &mut [u32], cx: &S3Ctx, ph: &mut [u64; 8]) {
     let S3Ctx { lm, cat_names, cat_rank, ncamp, nd, day_off, day_base } = *cx;
-    let S3 { gt, gids, rtmp, rv2, rg2, vals, cgids, ctmp, ctmp2, cg2, eoff, coff, ginfo, gperson, evs, cks, catsum, touched, ccnt, astart, pdays, cpos, active, name_buf } = b;
+    let S3 { gt, gids, rtmp, rv2, rg2, vals, cgids, ctmp, ctmp2, cg2, eoff, coff, ginfo, gperson, evs, cks, catsum, touched, ccnt, astart, pdays, cpos, active, name_buf, sblk } = b;
     let n: usize = es.iter().map(|x| x.1).sum();
     if n == 0 {
         return;
@@ -2488,11 +2491,29 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
         let mut i = 0;
         let mut sidx = 0u32;
         pdays.clear();
+        if ASBLK {
+            pdays.push((u32::MAX, u32::MAX));
+            sblk.clear();
+        }
         // add sessions [i0, i1) of campaign a to its assists, day by day
         macro_rules! assist {
             ($a:expr, $i0:expr, $i1:expr) => {{
                 let (a, i0, i1) = ($a as usize, $i0, $i1);
-                if i1 > i0 {
+                if ASBLK && i1 > i0 {
+                    // sessions [i0, i1) day block by day block: the block of session i0 is known, and
+                    // pdays ends with a sentinel (no bounds checks)
+                    let mut k = *sblk.get_unchecked(i0 as usize) as usize;
+                    loop {
+                        let (d, s0) = *pdays.get_unchecked(k);
+                        let s1 = pdays.get_unchecked(k + 1).1;
+                        let (lo, hi) = (i0.max(s0), i1.min(s1));
+                        *asst_cells.get_unchecked_mut(a * nd + d as usize) += hi - lo;
+                        k += 1;
+                        if pdays.get_unchecked(k).1 >= i1 {
+                            break;
+                        }
+                    }
+                } else if i1 > i0 {
                     let mut k = pdays.len() - 1;
                     while pdays.get_unchecked(k).1 > i0 {
                         k -= 1;
@@ -2563,7 +2584,10 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
                     flush!();
                 }
                 cur_day = day;
-                if ASSIST_IV {
+                if ASBLK {
+                    *pdays.last_mut().unwrap_unchecked() = (day, sidx);
+                    pdays.push((u32::MAX, u32::MAX));
+                } else if ASSIST_IV {
                     pdays.push((day, sidx));
                 }
                 r_sessions = 0;
@@ -2649,6 +2673,9 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
                         *asst_cells.get_unchecked_mut(a as usize * nd + day as usize) += 1;
                     }
                 }
+            }
+            if ASBLK {
+                sblk.push((pdays.len() - 2) as u32);
             }
             sidx += 1;
             let ce = cell.get_unchecked_mut(camp * nd + day as usize);
@@ -4603,7 +4630,7 @@ fn main() {
                 let mut cpos = vec![0u32; ncamp + 1];
                 let mut active: Vec<u32> = Vec::new();
                 let mut name_buf: Vec<u8> = Vec::new();
-                let mut s3b = S3 { gt: GTable { keys: Vec::new(), vals: Vec::new(), mask: 0 }, gids: Vec::new(), rtmp: Vec::new(), rv2: Vec::new(), rg2: Vec::new(), vals: Vec::new(), cgids: Vec::new(), ctmp: Vec::new(), ctmp2: Vec::new(), cg2: Vec::new(), eoff: Vec::new(), coff: Vec::new(), ginfo: Vec::new(), gperson: Vec::new(), evs: Vec::new(), cks: Vec::new(), catsum: vec![0u64; 256], touched: Vec::new(), ccnt: vec![0u32; ncamp + 1], astart: vec![0u32; ncamp + 1], pdays: Vec::new(), cpos: vec![0u32; ncamp + 1], active: Vec::new(), name_buf: Vec::new() };
+                let mut s3b = S3 { gt: GTable { keys: Vec::new(), vals: Vec::new(), mask: 0 }, gids: Vec::new(), rtmp: Vec::new(), rv2: Vec::new(), rg2: Vec::new(), vals: Vec::new(), cgids: Vec::new(), ctmp: Vec::new(), ctmp2: Vec::new(), cg2: Vec::new(), eoff: Vec::new(), coff: Vec::new(), ginfo: Vec::new(), gperson: Vec::new(), evs: Vec::new(), cks: Vec::new(), catsum: vec![0u64; 256], touched: Vec::new(), ccnt: vec![0u32; ncamp + 1], astart: vec![0u32; ncamp + 1], pdays: Vec::new(), cpos: vec![0u32; ncamp + 1], active: Vec::new(), name_buf: Vec::new(), sblk: Vec::new() };
                 // biggest partitions first (whale persons), so no thread is left finishing a big one alone
                 let mut qorder: Vec<(usize, u32)> = (0..q)
                     .map(|qi| ((0..nthreads).map(|t| ev2[t].get()[qi].len()).sum::<usize>(), qi as u32))
