@@ -936,6 +936,8 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     k
 }
 const SCAN: usize = 1 << 16;
+/// stage-2 dedup: bitmap prefilter, exact table only for possible copies
+const DEDUPBM: bool = true;
 /// stage 3: partitions of at least SUB3MIN events are split into SUB3 pieces by person hash
 const SUB3: usize = 4;
 const SUB3MIN: usize = 32768;
@@ -946,7 +948,7 @@ const PFG: usize = 0;
 /// stage-2 dedup: table bucket prefetch distance (0 = none)
 const PFD2: usize = 8;
 /// pin each thread to one of the allowed CPUs
-const PIN: bool = false;
+const PIN: bool = true;
 /// stage 2: link-table prefetch distance (records)
 const PF2: usize = 24;
 /// clicks are mapped to persons this many clicks after their link-table line was prefetched
@@ -2880,6 +2882,9 @@ fn main() {
                 let mut pool = Pool { free: Vec::new(), cur: 0, end: 0 };
                 let mut table: Vec<u64> = Vec::new();
                 let mut table32: Vec<u32> = Vec::new();
+                let mut bm1: Vec<u64> = Vec::new();
+                let mut bm2: Vec<u64> = Vec::new();
+                let mut cand: Vec<*mut Rec> = Vec::new();
                 let mut wc2: WcB<WC2K> = WcB::new(q);
                 let mut ph = [0u64; 8];
                 loop {
@@ -2913,7 +2918,79 @@ fn main() {
                             unreachable!()
                         };
                         let mut gi = 0usize;
-                        if n < (1 << 20) - 1 {
+                        if DEDUPBM && n < (1 << 20) - 1 {
+                            // two bitmaps (seen, seen twice) over 20 bits of the hash pick out the records that
+                            // may have a copy; only those go through the exact table
+                            let nbits = (n * 8).next_power_of_two().max(512);
+                            let bmk = nbits - 1;
+                            bm1.clear();
+                            bm1.resize(nbits / 64, 0);
+                            bm2.clear();
+                            bm2.resize(nbits / 64, 0);
+                            for s in &slices {
+                                for i in 0..s.1 {
+                                    let b = ((*s.0.add(i)).eh >> 20) as usize & bmk;
+                                    let (w, m) = (b >> 6, 1u64 << (b & 63));
+                                    let x = *bm1.get_unchecked(w);
+                                    *bm2.get_unchecked_mut(w) |= x & m;
+                                    *bm1.get_unchecked_mut(w) = x | m;
+                                }
+                            }
+                            cand.clear();
+                            for s in &slices {
+                                for i in 0..s.1 {
+                                    let r = s.0.add(i);
+                                    let b = ((*r).eh >> 20) as usize & bmk;
+                                    if (*bm2.get_unchecked(b >> 6) >> (b & 63)) & 1 != 0 {
+                                        cand.push(r);
+                                    }
+                                }
+                            }
+                            let nb = (cand.len() / 8).next_power_of_two().max(1);
+                            let bmask = nb - 1;
+                            table32.clear();
+                            table32.resize(nb * 16 + 16, 0);
+                            let tb = ((table32.as_mut_ptr() as usize + 63) & !63) as *mut u32;
+                            for ci in 0..cand.len() {
+                                let r = &mut **cand.get_unchecked(ci);
+                                let tag = ((r.eh >> 32) & 0xFFF) as u32;
+                                let t = _mm256_set1_epi32(tag as i32);
+                                let z = _mm256_setzero_si256();
+                                let mut b = r.eh as usize & bmask;
+                                'probe2: loop {
+                                    let p = tb.add(b * 16);
+                                    let v0 = _mm256_load_si256(p as *const __m256i);
+                                    let v1 = _mm256_load_si256(p.add(8) as *const __m256i);
+                                    let e0 = _mm256_cmpeq_epi32(v0, z);
+                                    let e1 = _mm256_cmpeq_epi32(v1, z);
+                                    let m0 = _mm256_andnot_si256(e0, _mm256_cmpeq_epi32(_mm256_srli_epi32::<20>(v0), t));
+                                    let m1 = _mm256_andnot_si256(e1, _mm256_cmpeq_epi32(_mm256_srli_epi32::<20>(v1), t));
+                                    let mut mt = (_mm256_movemask_ps(_mm256_castsi256_ps(m0)) as u32) | ((_mm256_movemask_ps(_mm256_castsi256_ps(m1)) as u32) << 8);
+                                    let em = (_mm256_movemask_ps(_mm256_castsi256_ps(e0)) as u32) | ((_mm256_movemask_ps(_mm256_castsi256_ps(e1)) as u32) << 8);
+                                    while mt != 0 {
+                                        let j = mt.trailing_zeros() as usize;
+                                        mt &= mt - 1;
+                                        let e = *p.add(j);
+                                        let o = &mut **cand.get_unchecked(((e & 0xF_FFFF) - 1) as usize);
+                                        if o.eh == r.eh {
+                                            if (r.ic >> 8) < (o.ic >> 8) {
+                                                o.ts = DEAD;
+                                                *p.add(j) = (tag << 20) | (ci as u32 + 1);
+                                            } else {
+                                                r.ts = DEAD;
+                                            }
+                                            break 'probe2;
+                                        }
+                                    }
+                                    if em != 0 {
+                                        *p.add(em.trailing_zeros() as usize) = (tag << 20) | (ci as u32 + 1);
+                                        break;
+                                    }
+                                    b = (b + 1) & bmask;
+                                }
+                            }
+                            let _ = &mut gi;
+                        } else if n < (1 << 20) - 1 {
                             // compact table: 16-slot buckets (one 64-byte line) of 12-bit tag << 20 | record
                             // index + 1; a lookup compares the whole bucket at once (no data-dependent branches
                             // unless a tag matches or the bucket is full)
