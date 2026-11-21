@@ -1752,6 +1752,13 @@ fn selftest() {
 }
 
 const LEAK: bool = option_env!("SS_LEAK_BUILD").is_some();
+/// TSC ticks per phase, summed over threads (SS_TIMING report):
+/// 0 dedup, 1 map+scatter (events), 2 clicks stage 2, 3 group+place, 4 click place, 5 per person
+static PHASE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+#[inline(always)]
+fn tsc() -> u64 {
+    unsafe { _rdtsc() }
+}
 
 extern "C" {
     fn execv(path: *const i8, argv: *const *const i8) -> i32;
@@ -1844,7 +1851,8 @@ fn main() {
         return;
     }
     let timing = std::env::var("SS_TIMING").is_ok();
-    let prefault = std::env::var("SS_NOPREFAULT").is_err();
+    // tmpfs page faults map 16 pages at a time (fault-around): on the scorer that beats MADV_POPULATE_READ
+    let prefault = std::env::var("SS_PREFAULT").is_ok();
     let click_dedup = std::env::var("SS_CLICK_DEDUP").is_ok();
     let strict = std::env::var("SS_STRICT").is_ok();
     let abl: usize = std::env::var("SS_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(99);
@@ -2215,6 +2223,7 @@ fn main() {
                 let mut table: Vec<u64> = Vec::new();
                 let mut table32: Vec<u32> = Vec::new();
                 let mut wc2: Wc<Rec2, 8> = Wc::new(q);
+                let mut ph = [0u64; 8];
                 let mut wcc2: Wc<RecC, 8> = Wc::new(q);
                 loop {
                     let pi = next_p1.fetch_add(1, Relaxed);
@@ -2228,6 +2237,7 @@ fn main() {
                                 (v.as_mut_ptr(), v.len())
                             })
                             .collect();
+                        let ta = tsc();
                         let n: usize = slices.iter().map(|s| s.1).sum();
                         let cap = (n * 2).next_power_of_two().max(16);
                         let mask = cap - 1;
@@ -2247,9 +2257,14 @@ fn main() {
                         };
                         let mut gi = 0usize;
                         if n < (1 << 20) - 1 {
-                            // compact table: 12-bit tag << 20 | record index + 1 (fits L2 for typical partitions)
+                            // compact table: 16-slot buckets (one 64-byte line) of 12-bit tag << 20 | record
+                            // index + 1; a lookup compares the whole bucket at once (no data-dependent branches
+                            // unless a tag matches or the bucket is full)
+                            let nb = (n / 8).next_power_of_two().max(1);
+                            let bmask = nb - 1;
                             table32.clear();
-                            table32.resize(cap, 0);
+                            table32.resize(nb * 16 + 16, 0);
+                            let tb = ((table32.as_mut_ptr() as usize + 63) & !63) as *mut u32;
                             for s in &slices {
                                 if abl == 6 {
                                     break;
@@ -2257,26 +2272,39 @@ fn main() {
                                 for i in 0..s.1 {
                                     let r = &mut *s.0.add(i);
                                     let tag = ((r.eh >> 32) & 0xFFF) as u32;
-                                    let mut idx = r.eh as usize & mask;
-                                    loop {
-                                        let e = *table32.get_unchecked(idx);
-                                        if e == 0 {
-                                            *table32.get_unchecked_mut(idx) = (tag << 20) | (gi as u32 + 1);
-                                            break;
-                                        }
-                                        if e >> 20 == tag {
+                                    let t = _mm256_set1_epi32(tag as i32);
+                                    let z = _mm256_setzero_si256();
+                                    let mut b = r.eh as usize & bmask;
+                                    'probe: loop {
+                                        let p = tb.add(b * 16);
+                                        let v0 = _mm256_load_si256(p as *const __m256i);
+                                        let v1 = _mm256_load_si256(p.add(8) as *const __m256i);
+                                        let e0 = _mm256_cmpeq_epi32(v0, z);
+                                        let e1 = _mm256_cmpeq_epi32(v1, z);
+                                        let m0 = _mm256_andnot_si256(e0, _mm256_cmpeq_epi32(_mm256_srli_epi32::<20>(v0), t));
+                                        let m1 = _mm256_andnot_si256(e1, _mm256_cmpeq_epi32(_mm256_srli_epi32::<20>(v1), t));
+                                        let mut mt = (_mm256_movemask_ps(_mm256_castsi256_ps(m0)) as u32) | ((_mm256_movemask_ps(_mm256_castsi256_ps(m1)) as u32) << 8);
+                                        let em = (_mm256_movemask_ps(_mm256_castsi256_ps(e0)) as u32) | ((_mm256_movemask_ps(_mm256_castsi256_ps(e1)) as u32) << 8);
+                                        while mt != 0 {
+                                            let j = mt.trailing_zeros() as usize;
+                                            mt &= mt - 1;
+                                            let e = *p.add(j);
                                             let o = &mut *resolve(((e & 0xF_FFFF) - 1) as usize);
                                             if o.eh == r.eh {
                                                 if (r.ic >> 8) < (o.ic >> 8) {
                                                     o.ts = DEAD;
-                                                    *table32.get_unchecked_mut(idx) = (tag << 20) | (gi as u32 + 1);
+                                                    *p.add(j) = (tag << 20) | (gi as u32 + 1);
                                                 } else {
                                                     r.ts = DEAD;
                                                 }
-                                                break;
+                                                break 'probe;
                                             }
                                         }
-                                        idx = (idx + 1) & mask;
+                                        if em != 0 {
+                                            *p.add(em.trailing_zeros() as usize) = (tag << 20) | (gi as u32 + 1);
+                                            break;
+                                        }
+                                        b = (b + 1) & bmask;
                                     }
                                     gi += 1;
                                 }
@@ -2313,6 +2341,8 @@ fn main() {
                             }
 
                         }
+                        let tb = tsc();
+                        ph[0] += tb - ta;
                         for s in &slices {
                             let recs = std::slice::from_raw_parts(s.0, s.1);
                             for i in 0..recs.len() {
@@ -2334,7 +2364,9 @@ fn main() {
                                 wc2.push(e2, part, o);
                             }
                         }
+                        ph[1] += tsc() - tb;
                     } else {
+                        let tc = tsc();
                         let pi = pi - p1;
                         let slices: Vec<(*mut RecC, usize)> = (0..nthreads)
                             .map(|t| {
@@ -2406,6 +2438,7 @@ fn main() {
                                 wcc2.push(c2, part, r);
                             }
                         }
+                        ph[2] += tsc() - tc;
                     }
                 }
                 wc2.finish(e2);
@@ -2454,6 +2487,7 @@ fn main() {
                         continue;
                     }
                     let nc: usize = (0..nthreads).map(|t| ck2[t].get()[qi].len()).sum();
+                    let t3a = tsc();
                     // group ids
                     let mut cap = (n / 4).next_power_of_two().max(1024);
                     gt.reset(cap);
@@ -2524,6 +2558,8 @@ fn main() {
                         eoff[g] = eoff[g - 1];
                     }
                     eoff[0] = 0;
+                    let t3b = tsc();
+                    ph[3] += t3b - t3a;
                     // clicks
                     coff.clear();
                     coff.resize(ng + 1, 0);
@@ -2572,6 +2608,8 @@ fn main() {
                         }
                         coff[0] = 0;
                     }
+                    let t3c = tsc();
+                    ph[4] += t3c - t3b;
                     // per person
                     for g in 0..ng {
                         let ev = &mut evs[eoff[g] as usize..eoff[g + 1] as usize];
@@ -2719,6 +2757,10 @@ fn main() {
                             active.clear();
                         }
                     }
+                    ph[5] += tsc() - t3c;
+                }
+                for (i, v) in ph.iter().enumerate() {
+                    PHASE[i].fetch_add(*v, Relaxed);
                 }
                 if timing && tid == 0 {
                     eprintln!("stage3 done {:?}", t0.elapsed());
@@ -2841,6 +2883,14 @@ fn main() {
         write_parquet(&format!("{out_dir}/user_daily/zz-leak.parquet"), k, &cols);
     }
     if timing {
+        let el = t0.elapsed().as_secs_f64();
+        let _ = el;
+        let names = ["dedup", "map", "clk2", "group", "clk3", "person"];
+        let mut line = String::from("phases(Mcyc, all threads)");
+        for (i, n) in names.iter().enumerate() {
+            line.push_str(&format!(" {}={}", n, PHASE[i].load(Relaxed) / 1_000_000));
+        }
+        eprintln!("{line}");
         let mut ru = [0i64; 18];
         unsafe { getrusage(0, &mut ru) };
         eprintln!(
