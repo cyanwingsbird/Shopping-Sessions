@@ -828,10 +828,7 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
 }
 const SCAN: usize = 1 << 16;
 /// stage 3: radix-sort each partition by ts instead of sorting each person's events
-const RADIX3: bool = true;
-const HIST: bool = false;
-static SIZEH: [std::sync::atomic::AtomicU64; 32] = [const { std::sync::atomic::AtomicU64::new(0) }; 32];
-static SIZEE: [std::sync::atomic::AtomicU64; 32] = [const { std::sync::atomic::AtomicU64::new(0) }; 32];
+const RADIX3: bool = false;
 
 #[derive(Default, Clone, Copy)]
 struct Sp7 {
@@ -1965,7 +1962,6 @@ fn main() {
     let perf_on = std::env::var("SS_PERF").is_ok();
     let abl: usize = std::env::var("SS_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(99);
     let envn = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
-    let repeat = envn("SS_REPEAT").unwrap_or(1);
     let nthreads = envn("SS_THREADS")
         .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
         .or(envn("NCPU"))
@@ -2162,22 +2158,9 @@ fn main() {
                 let mut wc1: Wc<Rec, 4> = Wc::new(p1);
                 let mut nlbuf: Vec<u32> = vec![0u32; SCAN + 64];
                 let mut wcc1: Wc<RecC, 8> = Wc::new(p1c);
-                // SS_REPEAT=n (single thread, parse benchmark): run the chunk loop n times, report each
-                let mut rep_left = repeat;
-                let mut rep_t = Instant::now();
                 loop {
                     let ci = next_chunk.fetch_add(1, Relaxed);
                     if ci >= chunks.len() {
-                        if rep_left > 1 {
-                            rep_left -= 1;
-                            eprintln!("repeat {:?}", rep_t.elapsed());
-                            rep_t = Instant::now();
-                            next_chunk.store(0, Relaxed);
-                            continue;
-                        }
-                        if repeat > 1 {
-                            eprintln!("repeat {:?}", rep_t.elapsed());
-                        }
                         break;
                     }
                     let c = chunks[ci];
@@ -2278,10 +2261,6 @@ fn main() {
                             let line_at = s;
                             s = s0 + *nlbuf.get_unchecked(j) as usize + 1;
                             let p = base().add(line_at);
-                            if abl == 0 {
-                                abl_sink += line_at as u64;
-                                continue;
-                            }
                             let sp = if strict { Sp7 { kind: 2, ..Default::default() } } else { split_ev7f(p, c.fe - line_at) };
                             if sp.kind >= 1 {
                                 // malformed, or a shape the fast splitter does not take: general path
@@ -2712,46 +2691,40 @@ fn main() {
                     }
                     eoff.push(acc);
                     if RADIX3 {
-                        // order the partition by ts first (LSD radix, 4 x 8 bits, stable; all four
-                        // histograms from one read), so that the stable placement by person below leaves
-                        // every person's events sorted by ts
+                        // order the partition by ts first (LSD radix, 3 x 11 bits, stable), so that the
+                        // stable placement by person below leaves every person's events sorted by ts
                         rv2.clear();
                         rv2.resize(n, 0);
                         rg2.clear();
                         rg2.resize(n, 0);
-                        let mut cnt = [[0u32; 256]; 4];
-                        for i in 0..n {
-                            let t = (*vals.get_unchecked(i) >> 32) as u32;
-                            cnt[0][(t & 255) as usize] += 1;
-                            cnt[1][((t >> 8) & 255) as usize] += 1;
-                            cnt[2][((t >> 16) & 255) as usize] += 1;
-                            cnt[3][(t >> 24) as usize] += 1;
-                        }
-                        for h in cnt.iter_mut() {
+                        let (mut sv, mut sg) = (vals.as_mut_ptr(), gids.as_mut_ptr());
+                        let (mut dv, mut dg) = (rv2.as_mut_ptr(), rg2.as_mut_ptr());
+                        for pass in 0..3u32 {
+                            let shift = 32 + 11 * pass;
+                            let mut cnt = [0u32; 2048];
+                            for i in 0..n {
+                                *cnt.get_unchecked_mut(((*sv.add(i) >> shift) & 2047) as usize) += 1;
+                            }
                             let mut a = 0u32;
-                            for c in h.iter_mut() {
+                            for c in cnt.iter_mut() {
                                 let x = *c;
                                 *c = a;
                                 a += x;
                             }
-                        }
-                        let (mut sv, mut sg) = (vals.as_mut_ptr(), gids.as_mut_ptr());
-                        let (mut dv, mut dg) = (rv2.as_mut_ptr(), rg2.as_mut_ptr());
-                        for pass in 0..4usize {
-                            let shift = 32 + 8 * pass as u32;
-                            let h = &mut cnt[pass];
                             for i in 0..n {
                                 let v = *sv.add(i);
-                                let d = ((v >> shift) & 255) as usize;
-                                let o = *h.get_unchecked(d) as usize;
-                                *h.get_unchecked_mut(d) = o as u32 + 1;
+                                let d = ((v >> shift) & 2047) as usize;
+                                let o = *cnt.get_unchecked(d) as usize;
+                                *cnt.get_unchecked_mut(d) = o as u32 + 1;
                                 *dv.add(o) = v;
                                 *dg.add(o) = *sg.add(i);
                             }
                             std::mem::swap(&mut sv, &mut dv);
                             std::mem::swap(&mut sg, &mut dg);
                         }
-                        // four passes: the sorted data is back in vals/gids
+                        // three passes: the sorted data is in rv2/rg2
+                        std::mem::swap(&mut vals, &mut rv2);
+                        std::mem::swap(&mut gids, &mut rg2);
                     }
                     evs.clear();
                     evs.resize(n, 0);
@@ -2828,11 +2801,6 @@ fn main() {
                             radix_ts(ev, &mut rtmp);
                         } else if ev.len() > 1 {
                             ev.sort_unstable();
-                        }
-                        if HIST {
-                            let b = (usize::BITS - ev.len().leading_zeros()) as usize;
-                            SIZEH[b.min(31)].fetch_add(1, Relaxed);
-                            SIZEE[b.min(31)].fetch_add(ev.len() as u64, Relaxed);
                         }
                         let ck = &mut cks[coff[g] as usize..coff[g + 1] as usize];
                         if ck.len() > 1 {
@@ -3106,14 +3074,6 @@ fn main() {
             line.push_str(&format!(" {}={}", n, PHASE[i].load(Relaxed) / 1_000_000));
         }
         eprintln!("{line}");
-        if HIST {
-            for b in 0..32 {
-                let c = SIZEH[b].load(Relaxed);
-                if c > 0 {
-                    eprintln!("persons with len < 2^{b}: {c} persons, {} events", SIZEE[b].load(Relaxed));
-                }
-            }
-        }
         if perf_on {
             let mut l = format!("perf(err {})", PERF_ERR.load(Relaxed));
             for st in 0..3 {
