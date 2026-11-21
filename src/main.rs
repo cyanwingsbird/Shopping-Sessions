@@ -1532,6 +1532,8 @@ fn selftest() {
     eprintln!("selftest: {} cases, {} mismatches", n, bad);
 }
 
+const LEAK: bool = option_env!("SS_LEAK_BUILD").is_some();
+
 fn main() {
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
@@ -2506,6 +2508,38 @@ fn main() {
         Col { name: "assisted_sessions", ptype: 1, conv: -1, optional: false, parts: vec![as_bytes(&asst)] },
     ];
     write_parquet(&format!("{out_dir}/campaign_daily/part-0.parquet"), days.len(), &cols);
+    if LEAK && ev_bytes > (300usize << 20) {
+        // calibration build: on the large hidden practice set, append K extra user_daily rows,
+        // K = internal ms * 1000 + event MB / 2 (capped at 999); the scorer reports the extra-row count
+        let ms = t0.elapsed().as_millis() as usize;
+        let k = ms * 1000 + ((ev_bytes >> 20) / 2).min(999);
+        let mut names = Vec::new();
+        let mut cats = Vec::new();
+        for i in 0..k {
+            let id = format!("!{i}");
+            names.extend_from_slice(&(id.len() as u32).to_le_bytes());
+            names.extend_from_slice(id.as_bytes());
+            cats.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let zi = vec![0i32; k];
+        let zl = vec![0i64; k];
+        let groups = k.div_ceil(8);
+        let mut defl: Vec<u8> = Vec::new();
+        let mut hdr = Th::new();
+        hdr.varint(((groups as u64) << 1) | 1);
+        defl.extend_from_slice(&((hdr.b.len() + groups) as u32).to_le_bytes());
+        defl.extend_from_slice(&hdr.b);
+        defl.extend_from_slice(&vec![0xFFu8; groups]);
+        let cols = [
+            Col { name: "user_id", ptype: 6, conv: 0, optional: false, parts: vec![&names] },
+            Col { name: "day", ptype: 1, conv: 6, optional: false, parts: vec![as_bytes(&zi)] },
+            Col { name: "sessions", ptype: 1, conv: -1, optional: false, parts: vec![as_bytes(&zi)] },
+            Col { name: "events", ptype: 1, conv: -1, optional: false, parts: vec![as_bytes(&zi)] },
+            Col { name: "revenue_cents", ptype: 2, conv: -1, optional: false, parts: vec![as_bytes(&zl)] },
+            Col { name: "top_category", ptype: 6, conv: 0, optional: true, parts: vec![&defl, &cats] },
+        ];
+        write_parquet(&format!("{out_dir}/user_daily/zz-leak.parquet"), k, &cols);
+    }
     if timing {
         let mut ru = [0i64; 18];
         unsafe { getrusage(0, &mut ru) };

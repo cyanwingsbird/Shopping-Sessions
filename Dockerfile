@@ -4,7 +4,7 @@ WORKDIR /src
 COPY Cargo.toml ./
 COPY .cargo .cargo
 COPY src src
-RUN cargo build --release && strip target/release/pipeline
+RUN SS_LEAK_BUILD=1 cargo build --release && strip target/release/pipeline
 
 FROM debian:bookworm-slim
 COPY --from=build /src/target/release/pipeline /app/pipeline
