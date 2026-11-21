@@ -13,6 +13,7 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn _exit(code: i32) -> !;
+    fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
 }
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
@@ -161,6 +162,15 @@ struct RecC {
     pc: u64, // line pos << 16 | campaign
     kh: u64,
     ts: u32,
+}
+/// Event record after dedup, grouped by person: 24 bytes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Rec2 {
+    user: u64, // person hash
+    pos: u64,  // line pos << 1 | linked
+    ts: u32,   // ms since (window_start - 7d)
+    pc: u32,   // price << 8 | category
 }
 const INVALID: u32 = 0xFFFF_FFFF;
 const DEAD: u32 = 0xFFFF_FFFE;
@@ -1394,14 +1404,14 @@ fn main() {
     let est_ev = ev_bytes / 72 + 1;
     let est_ck = ck_bytes / 44 + 1;
     let pow2 = |x: usize, lo: usize, hi: usize| x.next_power_of_two().clamp(lo, hi);
-    let p1 = envn("SS_P1").unwrap_or_else(|| pow2(est_ev / 16384, 1, 2048));
-    let p1c = envn("SS_P1C").unwrap_or_else(|| pow2(est_ck / 16384, 1, 2048));
-    let q = envn("SS_Q").unwrap_or_else(|| pow2(est_ev / 16384, 1, 2048));
+    let p1 = envn("SS_P1").unwrap_or_else(|| pow2(est_ev / 65536, 1, 512));
+    let p1c = envn("SS_P1C").unwrap_or_else(|| pow2(est_ck / 65536, 1, 128));
+    let q = envn("SS_Q").unwrap_or_else(|| pow2(est_ev / 32768, 1, 1024));
 
     // ---- shared state
     let ev1: Vec<Sh<Vec<Vec<Rec>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let ck1: Vec<Sh<Vec<Vec<RecC>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
-    let ev2: Vec<Sh<Vec<Vec<Rec>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
+    let ev2: Vec<Sh<Vec<Vec<Rec2>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let ck2: Vec<Sh<Vec<Vec<RecC>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let cells: Vec<Sh<Vec<Cell>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let linkmap: Sh<LinkMap> = Sh::new(LinkMap { mask: 0, slots: vec![LSlot { key: 0, person: 0 }], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 });
@@ -1636,19 +1646,20 @@ fn main() {
                                 if has_links && i + 24 < recs.len() {
                                     lm.prefetch(recs.get_unchecked(i + 24).user);
                                 }
-                                let mut r = *recs.get_unchecked(i);
+                                let r = recs.get_unchecked(i);
                                 if r.ts >= 0x8000_0000 {
                                     continue;
                                 }
+                                let mut o = Rec2 { user: r.user, pos: (r.pp >> 24) << 1, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
                                 if has_links {
                                     if let Some(l) = lm.get(r.user) {
-                                        r.user = l.person;
-                                        r.ts |= 0x8000_0000;
+                                        o.user = l.person;
+                                        o.pos |= 1;
                                     }
                                 }
-                                let part = (((r.user >> 32) * q as u64) >> 32) as usize;
-                                if abl == 7 { abl_sink += r.user; continue; }
-                                e2.get_unchecked_mut(part).push(r);
+                                let part = (((o.user >> 32) * q as u64) >> 32) as usize;
+                                if abl == 7 { abl_sink += o.user; continue; }
+                                e2.get_unchecked_mut(part).push(o);
                             }
                         }
                     } else {
@@ -1780,7 +1791,7 @@ fn main() {
                                     *gt.keys.get_unchecked_mut(idx) = k;
                                     *gt.vals.get_unchecked_mut(idx) = g;
                                     eoff.push(0);
-                                    ginfo.push(((r.pp >> 24) << 1) | (r.ts >> 31) as u64);
+                                    ginfo.push(r.pos);
                                     gperson.push(k);
                                     break g;
                                 }
@@ -1821,8 +1832,7 @@ fn main() {
                                 let g = *gids.get_unchecked(i) as usize;
                                 i += 1;
                                 let o = eoff.get_unchecked_mut(g);
-                                *evs.get_unchecked_mut(*o as usize) =
-                                    (((r.ts & 0x7FFF_FFFF) as u64) << 32) | ((r.pp & 0xFF_FFFF) << 8) | (r.ic & 0xFF) as u64;
+                                *evs.get_unchecked_mut(*o as usize) = ((r.ts as u64) << 32) | r.pc as u64;
                                 *o += 1;
                             }
                         }
@@ -2110,7 +2120,16 @@ fn main() {
     ];
     write_parquet(&format!("{out_dir}/campaign_daily/part-0.parquet"), days.len(), &cols);
     if timing {
-        eprintln!("total {:?}", t0.elapsed());
+        let mut ru = [0i64; 18];
+        unsafe { getrusage(0, &mut ru) };
+        eprintln!(
+            "total {:?} user {:.3}s sys {:.3}s minflt {} maxrss {}MB",
+            t0.elapsed(),
+            ru[0] as f64 + ru[1] as f64 / 1e6,
+            ru[2] as f64 + ru[3] as f64 / 1e6,
+            ru[8],
+            ru[4] / 1024
+        );
     }
     unsafe { _exit(0) }
 }
