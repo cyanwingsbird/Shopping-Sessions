@@ -981,7 +981,7 @@ const WC1K: usize = 4;
 /// stage-2 output blocks recycled from consumed stage-1 memory
 const RECYCLE: bool = true;
 /// stage 3 ts radix: 3 passes of 11 bits (else 4 of 8)
-const R11: bool = false;
+const R11: bool = true;
 /// assists counted per activation interval of a campaign instead of per session
 const ASSIST_IV: bool = true;
 /// stage 2: link lookups and scatter in two passes over each partition
@@ -1008,12 +1008,16 @@ const RELEASE: bool = true;
 const NAMECP: bool = true;
 /// stage 1: ISO ts with an offset parsed with ingest_ts in the same SIMD pass as the Z form
 const ISOM: bool = true;
+/// stage-2 dedup table: one 16-slot bucket per DDIV records (rounded up to a power of two)
+const DDIV: usize = 8;
+/// stage 1: user hash and type check before the timestamps (shorter live ranges)
+const EVORD: bool = true;
 /// stage 3: each person's clicks sorted on their own (insertion sort when few) instead of a partition radix
-const CKINS: bool = false;
+const CKINS: bool = true;
 /// stage 1: campaign ids of up to 8 bytes looked up by their bytes
 const CAMPS: bool = true;
 /// stage 2: persons of a partition kept in a side array (stage-1 records not written)
-const PMAP: bool = true;
+const PMAP: bool = false;
 /// stage 3: radix-sort each partition by ts instead of sorting each person's events
 const RADIX3: bool = true;
 const HIST: bool = false;
@@ -1533,8 +1537,18 @@ unsafe fn ev_lines<const STRICT: bool>(cx: &EvCtx, wc1: &mut Wc<Rec, WC1K>, evb:
             continue;
         }
         let h = hash($p.add(f0), l0);
-        let part = (((h >> 32) * p1 as u64) >> 32) as usize;
         if DIAG && abl == 2 { abl_sink += h; continue; }
+        // user and type first, so that the early fields' bounds die before the timestamps
+        let (f1, ulen) = $fld(1);
+        let uh = if EVORD { hash($p.add(f1), ulen) } else { 0 };
+        let (f4, tl) = $fld(4);
+        let tp4 = $p.add(f4);
+        let w4 = rd32(tp4);
+        let (a4, b4) = (w4 ^ u32::from_le_bytes(*b"view"), w4 ^ u32::from_le_bytes(*b"cart"));
+        // view or cart: both nonzero <=> bad; one test, no branch on which of the two it is
+        let vc = (tl == 4) & (((a4 | a4.wrapping_neg()) & (b4 | b4.wrapping_neg())) >> 31 == 0);
+        let pur = (tl == 8) && rd64(tp4) == u64::from_le_bytes(*b"purchase");
+        let (f5, l5) = $fld(5);
         let (f3, il) = $fld(3);
         let ip = $p.add(f3);
         let (f2, l2) = $fld(2);
@@ -1566,24 +1580,16 @@ unsafe fn ev_lines<const STRICT: bool>(cx: &EvCtx, wc1: &mut Wc<Rec, WC1K>, evb:
         let ing_rel = if ing == BAD { 0xFF_FFFF } else { (ing - ing_base).clamp(0, 0xFF_FFFE) as u32 };
         let mut rec = Rec { user: 0, pp: ($line as u64) << 24, eh: h, ts: INVALID, ic: ing_rel << 8 };
         'v: {
-            let (f1, ulen) = $fld(1);
-            let (f5, l5) = $fld(5);
             if ulen == 0 || l5 == 0 {
                 break 'v;
             }
             if t < ws || t >= we {
                 break 'v;
             }
-            let (f4, tl) = $fld(4);
-            let tp = $p.add(f4);
-            if tl == 4 {
-                let w = rd32(tp);
-                let (a, b) = (w ^ u32::from_le_bytes(*b"view"), w ^ u32::from_le_bytes(*b"cart"));
-                // both nonzero <=> bad type; one test, no branch on which of the two it is
-                if ((a | a.wrapping_neg()) & (b | b.wrapping_neg())) >> 31 != 0 {
+            if !vc {
+                if !pur {
                     break 'v;
                 }
-            } else if tl == 8 && rd64(tp) == u64::from_le_bytes(*b"purchase") {
                 let (f6, l6) = $fld(6);
                 let price = parse_price($p.add(f6), l6);
                 if price == 0 {
@@ -1592,15 +1598,14 @@ unsafe fn ev_lines<const STRICT: bool>(cx: &EvCtx, wc1: &mut Wc<Rec, WC1K>, evb:
                 let cat = prod_tab.get($p.add(f5), l5).unwrap_or(cat_unknown);
                 rec.pp |= price as u64;
                 rec.ic |= cat;
-            } else {
-                break 'v;
             }
             if ing != BAD && ing * 1000 - t > DAY_MS {
                 break 'v;
             }
-            rec.user = hash($p.add(f1), ulen);
+            rec.user = if EVORD { uh } else { hash($p.add(f1), ulen) };
             rec.ts = (t - base_ms) as u32;
         }
+        let part = (((h >> 32) * p1 as u64) >> 32) as usize;
         if DIAG && abl == 3 { abl_sink += rec.user + rec.ts as u64; continue; }
         wc1.push(evb, part, rec);
         };
@@ -1820,7 +1825,7 @@ unsafe fn s2_part(slices: &[(*mut Rec, usize)], bufs: &mut S2Buf, lm: &LinkMap, 
         // compact table: 16-slot buckets (one 64-byte line) of 12-bit tag << 20 | record
         // index + 1; a lookup compares the whole bucket at once (no data-dependent branches
         // unless a tag matches or the bucket is full)
-        let nb = (n / 8).next_power_of_two().max(1);
+        let nb = (n / DDIV).next_power_of_two().max(1);
         let bmask = nb - 1;
         table32.clear();
         table32.resize(nb * 16 + 16, 0);
@@ -2229,8 +2234,10 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
     if PHASE_FINE {
         ph[7] += tsc() - tg1;
     }
+    // every slot is written below: no zeroing
     evs.clear();
-    evs.resize(n, 0);
+    evs.reserve(n);
+    evs.set_len(n);
     for i in 0..n {
         let g = *gids.get_unchecked(i) as usize;
         let o = eoff.get_unchecked_mut(g);
@@ -2327,7 +2334,8 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
             }
         }
         cks.clear();
-        cks.resize(ncl, (0, 0, 0));
+        cks.reserve(ncl);
+        cks.set_len(ncl);
         for i in 0..cgids.len() {
             let g = *cgids.get_unchecked(i);
             let o = coff.get_unchecked_mut(g as usize);
