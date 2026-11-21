@@ -262,6 +262,11 @@ impl<const K: usize> WcB<K> {
         }
         o.last += K;
     }
+    #[inline(always)]
+    unsafe fn prefetch(&self, part: usize) {
+        let c = *self.cnt.get_unchecked(part) as usize;
+        _mm_prefetch((self.buf.as_ptr().add(part) as *const Rec2).add(c) as *const i8, _MM_HINT_T0);
+    }
     unsafe fn finish(&mut self, outs: &mut [BlkVec], pool: &mut Pool) {
         for (part, o) in outs.iter_mut().enumerate() {
             for j in 0..self.cnt[part] as usize {
@@ -931,6 +936,8 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     k
 }
 const SCAN: usize = 1 << 16;
+/// stage-2 scatter: staging-slot prefetch distance (0 = none)
+const PFW: usize = 0;
 /// stage-3 grouping: hash-slot prefetch distance (0 = none)
 const PFG: usize = 0;
 /// stage-2 dedup: table bucket prefetch distance (0 = none)
@@ -3023,6 +3030,10 @@ fn main() {
                             for s in &slices {
                                 let recs = std::slice::from_raw_parts(s.0, s.1);
                                 for i in 0..recs.len() {
+                                    if PFW > 0 && i + PFW < recs.len() {
+                                        let pu = recs.get_unchecked(i + PFW).eh;
+                                        wc2.prefetch((((pu >> 32) * q as u64) >> 32) as usize);
+                                    }
                                     let r = recs.get_unchecked(i);
                                     if r.ts >= 0x8000_0000 {
                                         continue;
