@@ -2159,41 +2159,46 @@ fn main() {
     let nd = (((we - base_ms) as u64 + day_off) / DAY_MS as u64 + 1) as usize;
 
     let tsu0 = t0.elapsed();
-    // ---- dimension tables
-    let prods = read_two_col(&format!("{data_dir}/products.csv"));
+    // ---- dimension tables (products: built by thread 0 while the others parse the link files)
     let camps = read_two_col(&format!("{data_dir}/campaigns.csv"));
     let tsu0b = t0.elapsed();
-    let mut cat_names: Vec<Vec<u8>> = Vec::new();
-    let mut cat_tab = StrTable::new(64);
-    let mut pids: Vec<&[u8]> = Vec::with_capacity(prods.rows.len());
-    let mut pcat: Vec<u32> = Vec::with_capacity(prods.rows.len());
-    for r in 0..prods.rows.len() {
-        let (p, c) = (prods.a(r), prods.b(r));
-        let ci = match unsafe { cat_tab.get(c.as_ptr(), c.len()) } {
-            Some(i) => i,
-            None => {
-                let i = cat_names.len() as u32;
-                cat_tab.insert(c, i);
-                cat_names.push(c.to_vec());
-                i
-            }
-        };
-        pids.push(p);
-        pcat.push(ci);
-    }
-    let prod_tab = IdTab::new(&pids, &pcat);
-    cat_tab.finish();
-    let cat_unknown = cat_names.len() as u32;
-    cat_names.push(b"unknown".to_vec());
-    assert!(cat_names.len() <= 255, "too many categories");
-    let ncat = cat_names.len();
-    // rank of each category name (byte-wise)
-    let mut order: Vec<usize> = (0..ncat).collect();
-    order.sort_by(|&a, &b| cat_names[a].cmp(&cat_names[b]));
-    let mut cat_rank = vec![0u32; ncat];
-    for (r, &i) in order.iter().enumerate() {
-        cat_rank[i] = r as u32;
-    }
+    let prods_path = format!("{data_dir}/products.csv");
+    let build_prods = move || -> (IdTab, Vec<Vec<u8>>, Vec<u32>, u32) {
+        let prods = read_two_col(&prods_path);
+        let mut cat_names: Vec<Vec<u8>> = Vec::new();
+        let mut cat_tab = StrTable::new(64);
+        let mut pids: Vec<&[u8]> = Vec::with_capacity(prods.rows.len());
+        let mut pcat: Vec<u32> = Vec::with_capacity(prods.rows.len());
+        for r in 0..prods.rows.len() {
+            let (p, c) = (prods.a(r), prods.b(r));
+            let ci = match unsafe { cat_tab.get(c.as_ptr(), c.len()) } {
+                Some(i) => i,
+                None => {
+                    let i = cat_names.len() as u32;
+                    cat_tab.insert(c, i);
+                    cat_names.push(c.to_vec());
+                    i
+                }
+            };
+            pids.push(p);
+            pcat.push(ci);
+        }
+        let prod_tab = IdTab::new(&pids, &pcat);
+        let cat_unknown = cat_names.len() as u32;
+        cat_names.push(b"unknown".to_vec());
+        assert!(cat_names.len() <= 255, "too many categories");
+        let ncat = cat_names.len();
+        // rank of each category name (byte-wise)
+        let mut order: Vec<usize> = (0..ncat).collect();
+        order.sort_by(|&a, &b| cat_names[a].cmp(&cat_names[b]));
+        let mut cat_rank = vec![0u32; ncat];
+        for (r, &i) in order.iter().enumerate() {
+            cat_rank[i] = r as u32;
+        }
+        (prod_tab, cat_names, cat_rank, cat_unknown)
+    };
+    let dims: Sh<Option<(IdTab, Vec<Vec<u8>>, Vec<u32>, u32)>> = Sh::new(None);
+    let build_prods = Sh::new(Some(build_prods));
     let cids: Vec<&[u8]> = (0..camps.rows.len()).map(|r| camps.a(r)).collect();
     let camp_tab = IdTab::new(&cids, &(0..camps.rows.len() as u32).collect::<Vec<u32>>());
     let ncamp = camps.rows.len();
@@ -2289,10 +2294,14 @@ fn main() {
             let (next_chunk, next_p1, next_q, barrier) = (&next_chunk, &next_p1, &next_q, &barrier);
             let links_ready = &links_ready;
             let (lchunks, next_lchunk, lraw) = (&lchunks, &next_lchunk, &lraw);
-            let (prod_tab, camp_tab, ln_segs, cat_names, cat_rank, out_dir) = (&prod_tab, &camp_tab, &ln_segs, &cat_names, &cat_rank, &out_dir);
+            let (camp_tab, ln_segs, out_dir) = (&camp_tab, &ln_segs, &out_dir);
+            let (dims, build_prods) = (&dims, &build_prods);
             let body = move || unsafe {
                 let mut perf = Perf::open(perf_on);
                 // ================= links: parsed by all threads, built by thread 0
+                if tid == 0 {
+                    *dims.get() = Some((build_prods.get().take().unwrap())());
+                }
                 if PLINKS {
                     let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
                     let mine = lraw[tid].get();
@@ -2323,8 +2332,8 @@ fn main() {
                             s += len + 1;
                         }
                     }
-                    barrier.wait();
                 }
+                barrier.wait();
                 if tid == 0 {
                     let mut raw: Vec<LinkRaw> = Vec::with_capacity((0..nthreads).map(|t| lraw[t].get().len()).sum());
                     for t in 0..nthreads {
@@ -2366,6 +2375,10 @@ fn main() {
                         eprintln!("links done {:?} ({} links, table {} MB, names {} MB)", t0.elapsed(), raw.len(), lmr.slots.len() * 64 >> 20, lmr.names.len() * 16 >> 20);
                     }
                 }
+                let (prod_tab, cat_names, cat_rank, cat_unknown) = {
+                    let d = dims.get().as_ref().unwrap();
+                    (&d.0, &d.1, &d.2, d.3)
+                };
                 // ================= stage 1: parse
                 let evb = ev1[tid].get();
                 let ckb = ck1[tid].get();
@@ -2577,35 +2590,9 @@ fn main() {
                         }
                         }
                     } else {
-                        'cblocks: while s < c.b {
-                        let scan_end = (s + SCAN).min(c.fe);
-                        let mut k = scan_nl(base().add(s), scan_end - s, nlbuf.as_mut_ptr());
-                        let s0 = s;
-                        if k == 0 {
-                            let mut e = scan_end;
-                            while e < c.fe && *base().add(e) != b'\n' {
-                                e += 1;
-                            }
-                            *nlbuf.get_unchecked_mut(0) = (e - s0) as u32;
-                            k = 1;
-                        }
-                        for j in 0..k {
-                            if s >= c.b {
-                                break 'cblocks;
-                            }
-                            let line = s;
-                            s = s0 + *nlbuf.get_unchecked(j) as usize + 1;
-                            let p = base().add(line);
-                            let sp = if strict { Sp4 { kind: 2, ..Default::default() } } else { split_ck4f(p, c.fe - line) };
-                            let (r, fs) = if sp.kind == 0 {
-                                (1u32, [sp.field(0), sp.field(1), sp.field(2), sp.field(3)])
-                            } else if sp.kind == 1 {
-                                continue;
-                            } else {
-                                let (_len, r) = split_ev::<4>(strict, p, c.fe - line, &mut st, &mut en);
-                                let qd = r == 2;
-                                (r, [fldq(p, &st, &en, 0, qd), fldq(p, &st, &en, 1, qd), fldq(p, &st, &en, 2, qd), fldq(p, &st, &en, 3, qd)])
-                            };
+                        macro_rules! ck_body {
+                            ($p:expr, $line:expr, $r:expr, $fs:expr) => {
+                            let (p, line, r, fs) = ($p, $line, $r, $fs);
                             let ((f0, l0), (f1, l1), (f2, l2), (f3, l3)) = (fs[0], fs[1], fs[2], fs[3]);
                             if r == 0 || l0 == 0 || l1 == 0 {
                                 continue;
@@ -2652,6 +2639,58 @@ fn main() {
                                 ts: (t - base_ms) as u32,
                                 kh: h as u32,
                             });
+                            };
+                        }
+                        if !SCANNL {
+                            while s < c.b {
+                                let line = s;
+                                let p = base().add(line);
+                                let sp = if strict { Sp4 { kind: 2, ..Default::default() } } else { split_ck4f(p, c.fe - line) };
+                                let (r, fs) = if sp.kind == 0 {
+                                    s = line + sp.len as usize + 1;
+                                    (1u32, [sp.field(0), sp.field(1), sp.field(2), sp.field(3)])
+                                } else if sp.kind == 1 {
+                                    s = line + sp.len as usize + 1;
+                                    continue;
+                                } else {
+                                    let (len, r) = split_ev::<4>(strict, p, c.fe - line, &mut st, &mut en);
+                                    s = line + len + 1;
+                                    let qd = r == 2;
+                                    (r, [fldq(p, &st, &en, 0, qd), fldq(p, &st, &en, 1, qd), fldq(p, &st, &en, 2, qd), fldq(p, &st, &en, 3, qd)])
+                                };
+                                ck_body!(p, line, r, fs);
+                            }
+                        }
+                        'cblocks: while SCANNL && s < c.b {
+                        let scan_end = (s + SCAN).min(c.fe);
+                        let mut k = scan_nl(base().add(s), scan_end - s, nlbuf.as_mut_ptr());
+                        let s0 = s;
+                        if k == 0 {
+                            let mut e = scan_end;
+                            while e < c.fe && *base().add(e) != b'\n' {
+                                e += 1;
+                            }
+                            *nlbuf.get_unchecked_mut(0) = (e - s0) as u32;
+                            k = 1;
+                        }
+                        for j in 0..k {
+                            if s >= c.b {
+                                break 'cblocks;
+                            }
+                            let line = s;
+                            s = s0 + *nlbuf.get_unchecked(j) as usize + 1;
+                            let p = base().add(line);
+                            let sp = if strict { Sp4 { kind: 2, ..Default::default() } } else { split_ck4f(p, c.fe - line) };
+                            let (r, fs) = if sp.kind == 0 {
+                                (1u32, [sp.field(0), sp.field(1), sp.field(2), sp.field(3)])
+                            } else if sp.kind == 1 {
+                                continue;
+                            } else {
+                                let (_len, r) = split_ev::<4>(strict, p, c.fe - line, &mut st, &mut en);
+                                let qd = r == 2;
+                                (r, [fldq(p, &st, &en, 0, qd), fldq(p, &st, &en, 1, qd), fldq(p, &st, &en, 2, qd), fldq(p, &st, &en, 3, qd)])
+                            };
+                            ck_body!(p, line, r, fs);
                         }
                         }
                     }
