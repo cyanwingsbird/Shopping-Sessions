@@ -179,6 +179,103 @@ impl<T: Copy, const K: usize> Wc<T, K> {
     }
 }
 
+/// Stage-2 output by person: a list of fixed-size blocks per partition (all full but the last).
+/// Blocks come from a per-thread free list fed with stage-1 memory already consumed, so most of
+/// them need no fresh (kernel-zeroed) pages.
+const BLK: usize = 680; // Rec2 records per block: a multiple of 8, 16320 bytes
+#[derive(Default)]
+struct BlkVec {
+    blocks: Vec<*mut Rec2>,
+    last: usize, // records in the last block
+}
+impl BlkVec {
+    fn len(&self) -> usize {
+        if self.blocks.is_empty() { 0 } else { (self.blocks.len() - 1) * BLK + self.last }
+    }
+}
+struct Pool {
+    free: Vec<*mut Rec2>,
+    cur: usize,
+    end: usize,
+}
+impl Pool {
+    #[inline(always)]
+    unsafe fn get(&mut self) -> *mut Rec2 {
+        if let Some(b) = self.free.pop() {
+            return b;
+        }
+        if self.cur + BLK * 24 > self.end {
+            let sz = 64usize << 20;
+            let m = mmap(std::ptr::null_mut(), sz, 3, 0x22 | MAP_NORESERVE, -1, 0);
+            assert!(m as isize != -1, "mmap pool");
+            madvise(m, sz, 14);
+            self.cur = m as usize;
+            self.end = m as usize + sz;
+        }
+        let b = self.cur as *mut Rec2;
+        self.cur += BLK * 24;
+        b
+    }
+    /// carve whole 64-byte-aligned blocks out of a consumed buffer
+    unsafe fn give(&mut self, p: *mut u8, bytes: usize) {
+        let a = (p as usize + 63) & !63;
+        let e = p as usize + bytes;
+        let mut b = a;
+        while b + BLK * 24 <= e {
+            self.free.push(b as *mut Rec2);
+            b += (BLK * 24 + 63) & !63;
+        }
+    }
+}
+/// Write-combining staging into BlkVecs (K records = whole 64-byte lines, streaming stores).
+struct WcB<const K: usize> {
+    buf: Vec<[Rec2; K]>,
+    cnt: Vec<u32>,
+}
+impl<const K: usize> WcB<K> {
+    fn new(n: usize) -> Self {
+        WcB { buf: vec![unsafe { std::mem::zeroed() }; n], cnt: vec![0; n] }
+    }
+    #[inline(always)]
+    unsafe fn push(&mut self, outs: &mut [BlkVec], pool: &mut Pool, part: usize, v: Rec2) {
+        let c = *self.cnt.get_unchecked(part) as usize;
+        *self.buf.get_unchecked_mut(part).get_unchecked_mut(c) = v;
+        if c + 1 < K {
+            *self.cnt.get_unchecked_mut(part) = (c + 1) as u32;
+            return;
+        }
+        *self.cnt.get_unchecked_mut(part) = 0;
+        let o = outs.get_unchecked_mut(part);
+        if o.last == BLK || o.blocks.is_empty() {
+            o.blocks.push(pool.get());
+            o.last = 0;
+        }
+        let dst = (*o.blocks.last().unwrap_unchecked()).add(o.last) as *mut u8;
+        let src = self.buf.get_unchecked(part).as_ptr() as *const u8;
+        let bytes = K * 24;
+        let mut i = 0;
+        while i < bytes {
+            _mm256_stream_si256(dst.add(i) as *mut __m256i, _mm256_loadu_si256(src.add(i) as *const __m256i));
+            i += 32;
+        }
+        o.last += K;
+    }
+    unsafe fn finish(&mut self, outs: &mut [BlkVec], pool: &mut Pool) {
+        for (part, o) in outs.iter_mut().enumerate() {
+            for j in 0..self.cnt[part] as usize {
+                if o.last == BLK || o.blocks.is_empty() {
+                    o.blocks.push(pool.get());
+                    o.last = 0;
+                }
+                *(*o.blocks.last().unwrap()).add(o.last) = self.buf[part][j];
+                o.last += 1;
+            }
+            self.cnt[part] = 0;
+        }
+        _mm_sfence();
+    }
+}
+
 struct Sh<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for Sh<T> {}
 impl<T> Sh<T> {
@@ -832,6 +929,12 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     k
 }
 const SCAN: usize = 1 << 16;
+/// records per partition staged before a streaming write in stage 1 (32-byte records)
+const WC1K: usize = 4;
+/// stage-2 output blocks recycled from consumed stage-1 memory
+const RECYCLE: bool = true;
+/// stage 3 ts radix: 3 passes of 11 bits (else 4 of 8)
+const R11: bool = false;
 /// assists counted per activation interval of a campaign instead of per session
 const ASSIST_IV: bool = true;
 /// stage 2: link lookups and scatter in two passes over each partition
@@ -1406,7 +1509,7 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
         return LinkMap { mask: 0, nb: 1, slots: vec![LB0], ovf: vec![0], names: vec![LSlot { key: 0, person: 0 }], nmask: 0, filt: vec![0], fmask: 0, empty: LB0 };
     }
     let tb0 = Instant::now();
-    let cap = (raw.len() * 4).next_power_of_two().max(16);
+    let cap = (raw.len() * 2).next_power_of_two().max(16);
     let mask = cap - 1;
     let mut slots = vec![LSlot { key: 0, person: 0 }; cap];
     let mut hashes: Vec<u64> = Vec::with_capacity(raw.len() * 2);
@@ -2159,41 +2262,46 @@ fn main() {
     let nd = (((we - base_ms) as u64 + day_off) / DAY_MS as u64 + 1) as usize;
 
     let tsu0 = t0.elapsed();
-    // ---- dimension tables
-    let prods = read_two_col(&format!("{data_dir}/products.csv"));
+    // ---- dimension tables (products: built by thread 0 while the others parse the link files)
     let camps = read_two_col(&format!("{data_dir}/campaigns.csv"));
     let tsu0b = t0.elapsed();
-    let mut cat_names: Vec<Vec<u8>> = Vec::new();
-    let mut cat_tab = StrTable::new(64);
-    let mut pids: Vec<&[u8]> = Vec::with_capacity(prods.rows.len());
-    let mut pcat: Vec<u32> = Vec::with_capacity(prods.rows.len());
-    for r in 0..prods.rows.len() {
-        let (p, c) = (prods.a(r), prods.b(r));
-        let ci = match unsafe { cat_tab.get(c.as_ptr(), c.len()) } {
-            Some(i) => i,
-            None => {
-                let i = cat_names.len() as u32;
-                cat_tab.insert(c, i);
-                cat_names.push(c.to_vec());
-                i
-            }
-        };
-        pids.push(p);
-        pcat.push(ci);
-    }
-    let prod_tab = IdTab::new(&pids, &pcat);
-    cat_tab.finish();
-    let cat_unknown = cat_names.len() as u32;
-    cat_names.push(b"unknown".to_vec());
-    assert!(cat_names.len() <= 255, "too many categories");
-    let ncat = cat_names.len();
-    // rank of each category name (byte-wise)
-    let mut order: Vec<usize> = (0..ncat).collect();
-    order.sort_by(|&a, &b| cat_names[a].cmp(&cat_names[b]));
-    let mut cat_rank = vec![0u32; ncat];
-    for (r, &i) in order.iter().enumerate() {
-        cat_rank[i] = r as u32;
-    }
+    let prods_path = format!("{data_dir}/products.csv");
+    let build_prods = move || -> (IdTab, Vec<Vec<u8>>, Vec<u32>, u32) {
+        let prods = read_two_col(&prods_path);
+        let mut cat_names: Vec<Vec<u8>> = Vec::new();
+        let mut cat_tab = StrTable::new(64);
+        let mut pids: Vec<&[u8]> = Vec::with_capacity(prods.rows.len());
+        let mut pcat: Vec<u32> = Vec::with_capacity(prods.rows.len());
+        for r in 0..prods.rows.len() {
+            let (p, c) = (prods.a(r), prods.b(r));
+            let ci = match unsafe { cat_tab.get(c.as_ptr(), c.len()) } {
+                Some(i) => i,
+                None => {
+                    let i = cat_names.len() as u32;
+                    cat_tab.insert(c, i);
+                    cat_names.push(c.to_vec());
+                    i
+                }
+            };
+            pids.push(p);
+            pcat.push(ci);
+        }
+        let prod_tab = IdTab::new(&pids, &pcat);
+        let cat_unknown = cat_names.len() as u32;
+        cat_names.push(b"unknown".to_vec());
+        assert!(cat_names.len() <= 255, "too many categories");
+        let ncat = cat_names.len();
+        // rank of each category name (byte-wise)
+        let mut order: Vec<usize> = (0..ncat).collect();
+        order.sort_by(|&a, &b| cat_names[a].cmp(&cat_names[b]));
+        let mut cat_rank = vec![0u32; ncat];
+        for (r, &i) in order.iter().enumerate() {
+            cat_rank[i] = r as u32;
+        }
+        (prod_tab, cat_names, cat_rank, cat_unknown)
+    };
+    let dims: Sh<Option<(IdTab, Vec<Vec<u8>>, Vec<u32>, u32)>> = Sh::new(None);
+    let build_prods = Sh::new(Some(build_prods));
     let cids: Vec<&[u8]> = (0..camps.rows.len()).map(|r| camps.a(r)).collect();
     let camp_tab = IdTab::new(&cids, &(0..camps.rows.len() as u32).collect::<Vec<u32>>());
     let ncamp = camps.rows.len();
@@ -2255,7 +2363,7 @@ fn main() {
     // ---- shared state
     let ev1: Vec<Sh<Vec<Vec<Rec>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let ck1: Vec<Sh<Vec<Vec<RecC>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
-    let ev2: Vec<Sh<Vec<Vec<Rec2>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
+    let ev2: Vec<Sh<Vec<BlkVec>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let ck2: Vec<Sh<Vec<Vec<RecC>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let cells: Vec<Sh<Vec<Cell>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let assists: Vec<Sh<Vec<u32>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
@@ -2289,10 +2397,14 @@ fn main() {
             let (next_chunk, next_p1, next_q, barrier) = (&next_chunk, &next_p1, &next_q, &barrier);
             let links_ready = &links_ready;
             let (lchunks, next_lchunk, lraw) = (&lchunks, &next_lchunk, &lraw);
-            let (prod_tab, camp_tab, ln_segs, cat_names, cat_rank, out_dir) = (&prod_tab, &camp_tab, &ln_segs, &cat_names, &cat_rank, &out_dir);
+            let (camp_tab, ln_segs, out_dir) = (&camp_tab, &ln_segs, &out_dir);
+            let (dims, build_prods) = (&dims, &build_prods);
             let body = move || unsafe {
                 let mut perf = Perf::open(perf_on);
                 // ================= links: parsed by all threads, built by thread 0
+                if tid == 0 {
+                    *dims.get() = Some((build_prods.get().take().unwrap())());
+                }
                 if PLINKS {
                     let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
                     let mine = lraw[tid].get();
@@ -2323,8 +2435,8 @@ fn main() {
                             s += len + 1;
                         }
                     }
-                    barrier.wait();
                 }
+                barrier.wait();
                 if tid == 0 {
                     let mut raw: Vec<LinkRaw> = Vec::with_capacity((0..nthreads).map(|t| lraw[t].get().len()).sum());
                     for t in 0..nthreads {
@@ -2366,6 +2478,10 @@ fn main() {
                         eprintln!("links done {:?} ({} links, table {} MB, names {} MB)", t0.elapsed(), raw.len(), lmr.slots.len() * 64 >> 20, lmr.names.len() * 16 >> 20);
                     }
                 }
+                let (prod_tab, cat_names, cat_rank, cat_unknown) = {
+                    let d = dims.get().as_ref().unwrap();
+                    (&d.0, &d.1, &d.2, d.3)
+                };
                 // ================= stage 1: parse
                 let evb = ev1[tid].get();
                 let ckb = ck1[tid].get();
@@ -2373,7 +2489,7 @@ fn main() {
                 *ckb = (0..p1c).map(|_| Vec::with_capacity(est_ck / (p1c * nthreads) * 17 / 16 + 64)).collect();
                 let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
                 let mut abl_sink = 0u64;
-                let mut wc1: Wc<Rec, 4> = Wc::new(p1);
+                let mut wc1: Wc<Rec, WC1K> = Wc::new(p1);
                 let mut nlbuf: Vec<u32> = vec![0u32; SCAN + 64];
                 let mut wcc1: Wc<RecC, 8> = Wc::new(p1c);
                 // clicks need no dedup (copies are identical): their chunks come last in stage 1, when the
@@ -2577,35 +2693,9 @@ fn main() {
                         }
                         }
                     } else {
-                        'cblocks: while s < c.b {
-                        let scan_end = (s + SCAN).min(c.fe);
-                        let mut k = scan_nl(base().add(s), scan_end - s, nlbuf.as_mut_ptr());
-                        let s0 = s;
-                        if k == 0 {
-                            let mut e = scan_end;
-                            while e < c.fe && *base().add(e) != b'\n' {
-                                e += 1;
-                            }
-                            *nlbuf.get_unchecked_mut(0) = (e - s0) as u32;
-                            k = 1;
-                        }
-                        for j in 0..k {
-                            if s >= c.b {
-                                break 'cblocks;
-                            }
-                            let line = s;
-                            s = s0 + *nlbuf.get_unchecked(j) as usize + 1;
-                            let p = base().add(line);
-                            let sp = if strict { Sp4 { kind: 2, ..Default::default() } } else { split_ck4f(p, c.fe - line) };
-                            let (r, fs) = if sp.kind == 0 {
-                                (1u32, [sp.field(0), sp.field(1), sp.field(2), sp.field(3)])
-                            } else if sp.kind == 1 {
-                                continue;
-                            } else {
-                                let (_len, r) = split_ev::<4>(strict, p, c.fe - line, &mut st, &mut en);
-                                let qd = r == 2;
-                                (r, [fldq(p, &st, &en, 0, qd), fldq(p, &st, &en, 1, qd), fldq(p, &st, &en, 2, qd), fldq(p, &st, &en, 3, qd)])
-                            };
+                        macro_rules! ck_body {
+                            ($p:expr, $line:expr, $r:expr, $fs:expr) => {
+                            let (p, line, r, fs) = ($p, $line, $r, $fs);
                             let ((f0, l0), (f1, l1), (f2, l2), (f3, l3)) = (fs[0], fs[1], fs[2], fs[3]);
                             if r == 0 || l0 == 0 || l1 == 0 {
                                 continue;
@@ -2652,6 +2742,58 @@ fn main() {
                                 ts: (t - base_ms) as u32,
                                 kh: h as u32,
                             });
+                            };
+                        }
+                        if !SCANNL {
+                            while s < c.b {
+                                let line = s;
+                                let p = base().add(line);
+                                let sp = if strict { Sp4 { kind: 2, ..Default::default() } } else { split_ck4f(p, c.fe - line) };
+                                let (r, fs) = if sp.kind == 0 {
+                                    s = line + sp.len as usize + 1;
+                                    (1u32, [sp.field(0), sp.field(1), sp.field(2), sp.field(3)])
+                                } else if sp.kind == 1 {
+                                    s = line + sp.len as usize + 1;
+                                    continue;
+                                } else {
+                                    let (len, r) = split_ev::<4>(strict, p, c.fe - line, &mut st, &mut en);
+                                    s = line + len + 1;
+                                    let qd = r == 2;
+                                    (r, [fldq(p, &st, &en, 0, qd), fldq(p, &st, &en, 1, qd), fldq(p, &st, &en, 2, qd), fldq(p, &st, &en, 3, qd)])
+                                };
+                                ck_body!(p, line, r, fs);
+                            }
+                        }
+                        'cblocks: while SCANNL && s < c.b {
+                        let scan_end = (s + SCAN).min(c.fe);
+                        let mut k = scan_nl(base().add(s), scan_end - s, nlbuf.as_mut_ptr());
+                        let s0 = s;
+                        if k == 0 {
+                            let mut e = scan_end;
+                            while e < c.fe && *base().add(e) != b'\n' {
+                                e += 1;
+                            }
+                            *nlbuf.get_unchecked_mut(0) = (e - s0) as u32;
+                            k = 1;
+                        }
+                        for j in 0..k {
+                            if s >= c.b {
+                                break 'cblocks;
+                            }
+                            let line = s;
+                            s = s0 + *nlbuf.get_unchecked(j) as usize + 1;
+                            let p = base().add(line);
+                            let sp = if strict { Sp4 { kind: 2, ..Default::default() } } else { split_ck4f(p, c.fe - line) };
+                            let (r, fs) = if sp.kind == 0 {
+                                (1u32, [sp.field(0), sp.field(1), sp.field(2), sp.field(3)])
+                            } else if sp.kind == 1 {
+                                continue;
+                            } else {
+                                let (_len, r) = split_ev::<4>(strict, p, c.fe - line, &mut st, &mut en);
+                                let qd = r == 2;
+                                (r, [fldq(p, &st, &en, 0, qd), fldq(p, &st, &en, 1, qd), fldq(p, &st, &en, 2, qd), fldq(p, &st, &en, 3, qd)])
+                            };
+                            ck_body!(p, line, r, fs);
                         }
                         }
                     }
@@ -2673,10 +2815,11 @@ fn main() {
                 let lm: &LinkMap = linkmap.get();
                 let has_links = lm.mask != 0 && abl != 5;
                 let e2 = ev2[tid].get();
-                *e2 = (0..q).map(|_| Vec::with_capacity(est_ev / (q * nthreads) * 5 / 4 + 64)).collect();
+                *e2 = (0..q).map(|_| BlkVec::default()).collect();
+                let mut pool = Pool { free: Vec::new(), cur: 0, end: 0 };
                 let mut table: Vec<u64> = Vec::new();
                 let mut table32: Vec<u32> = Vec::new();
-                let mut wc2: Wc<Rec2, WC2K> = Wc::new(q);
+                let mut wc2: WcB<WC2K> = WcB::new(q);
                 let mut ph = [0u64; 8];
                 loop {
                     let pi = next_p1.fetch_add(1, Relaxed);
@@ -2820,7 +2963,8 @@ fn main() {
                                     }
                                     let o = Rec2 { user: r.eh, pos: ((r.pp >> 24) << 1) | r.user, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
                                     let part = (((o.user >> 32) * q as u64) >> 32) as usize;
-                                    wc2.push(e2, part, o);
+                                    if abl == 7 { abl_sink += o.user; continue; }
+                                    wc2.push(e2, &mut pool, part, o);
                                 }
                             }
                         }
@@ -2845,10 +2989,17 @@ fn main() {
                                 }
                                 let part = (((o.user >> 32) * q as u64) >> 32) as usize;
                                 if abl == 7 { abl_sink += o.user; continue; }
-                                wc2.push(e2, part, o);
+                                wc2.push(e2, &mut pool, part, o);
                             }
                         }
                         ph[1] += tsc() - tb;
+                        if RECYCLE {
+                            // the partition's stage-1 records are consumed: their memory becomes blocks
+                            for t in 0..nthreads {
+                                let v = &ev1[t].get()[pi];
+                                pool.give(v.as_ptr() as *mut u8, v.capacity() * std::mem::size_of::<Rec>());
+                            }
+                        }
                     } else {
                         let tc = tsc();
                         let pi = pi - p1;
@@ -2925,7 +3076,7 @@ fn main() {
                         ph[2] += tsc() - tc;
                     }
                 }
-                wc2.finish(e2);
+                wc2.finish(e2, &mut pool);
                 if !ck_direct {
                     wcc2.finish(c2);
                 }
@@ -2997,7 +3148,10 @@ fn main() {
                     ginfo.clear();
                     gperson.clear();
                     for t in 0..nthreads {
-                        for r in ev2[t].get()[qi].iter() {
+                        let bv = &ev2[t].get()[qi];
+                        for (bi, &bp) in bv.blocks.iter().enumerate() {
+                        let blen = if bi + 1 == bv.blocks.len() { bv.last } else { BLK };
+                        for r in std::slice::from_raw_parts(bp, blen).iter() {
                             let k = r.user;
                             let mut idx = k as usize & gt.mask;
                             let g = loop {
@@ -3033,6 +3187,7 @@ fn main() {
                                 }
                             }
                         }
+                        }
                     }
                     let ng = eoff.len();
                     // prefix sums (eoff[g] = start)
@@ -3043,14 +3198,55 @@ fn main() {
                         acc += c;
                     }
                     eoff.push(acc);
+                    let tg1 = if PHASE_FINE { tsc() } else { 0 };
+                    ph[6] += tg1 - t3a;
                     if RADIX3 {
                         // order the partition by ts first (LSD radix, 4 x 8 bits, stable; all four
                         // histograms from one read), so that the stable placement by person below leaves
                         // every person's events sorted by ts
                         rv2.clear();
-                        rv2.resize(n, 0);
+                        rv2.reserve(n);
+                        rv2.set_len(n);
                         rg2.clear();
-                        rg2.resize(n, 0);
+                        rg2.reserve(n);
+                        rg2.set_len(n);
+                        if R11 {
+                        // three passes of 11 bits
+                        let mut cnt = vec![0u32; 3 * 2048];
+                        for i in 0..n {
+                            let t = (*vals.get_unchecked(i) >> 32) as usize;
+                            *cnt.get_unchecked_mut(t & 2047) += 1;
+                            *cnt.get_unchecked_mut(2048 + ((t >> 11) & 2047)) += 1;
+                            *cnt.get_unchecked_mut(4096 + (t >> 22)) += 1;
+                        }
+                        for h in cnt.chunks_mut(2048) {
+                            let mut a = 0u32;
+                            for c in h.iter_mut() {
+                                let x = *c;
+                                *c = a;
+                                a += x;
+                            }
+                        }
+                        let (mut sv, mut sg) = (vals.as_mut_ptr(), gids.as_mut_ptr());
+                        let (mut dv, mut dg) = (rv2.as_mut_ptr(), rg2.as_mut_ptr());
+                        for pass in 0..3usize {
+                            let shift = 32 + 11 * pass as u32;
+                            let h = cnt.as_mut_ptr().add(2048 * pass);
+                            for i in 0..n {
+                                let v = *sv.add(i);
+                                let d = ((v >> shift) & 2047) as usize;
+                                let o = *h.add(d) as usize;
+                                *h.add(d) = o as u32 + 1;
+                                *dv.add(o) = v;
+                                *dg.add(o) = *sg.add(i);
+                            }
+                            std::mem::swap(&mut sv, &mut dv);
+                            std::mem::swap(&mut sg, &mut dg);
+                        }
+                        // odd number of passes: the sorted data is in rv2/rg2
+                        std::mem::swap(&mut vals, &mut rv2);
+                        std::mem::swap(&mut gids, &mut rg2);
+                        } else {
                         let mut cnt = [[0u32; 256]; 4];
                         for i in 0..n {
                             let t = (*vals.get_unchecked(i) >> 32) as u32;
@@ -3084,7 +3280,10 @@ fn main() {
                             std::mem::swap(&mut sg, &mut dg);
                         }
                         // four passes: the sorted data is back in vals/gids
+                        }
                     }
+                    let tg2 = if PHASE_FINE { tsc() } else { 0 };
+                    ph[7] += tg2 - tg1;
                     evs.clear();
                     evs.resize(n, 0);
                     for i in 0..n {
@@ -3220,7 +3419,7 @@ fn main() {
                             });
                         }
                         let tq1 = if PHASE_FINE { tsc() } else { 0 };
-                        ph[6] += tq1 - tq0;
+                        let _ = tq1 - tq0;
                         // names are read from the input lines: fetch them a few persons ahead
                         if g + 8 < ng {
                             let inf = *ginfo.get_unchecked(g + 8);
@@ -3245,7 +3444,7 @@ fn main() {
                             name_buf.extend_from_slice(sl(np, nl));
                         }
                         let tq2 = if PHASE_FINE { tsc() } else { 0 };
-                        ph[7] += tq2 - tq1;
+                        let _ = tq2 - tq1;
                         let n = ev.len();
                         let nck = ck.len();
                         let (mut lo, mut hi) = (0usize, 0usize);
@@ -3546,7 +3745,7 @@ fn main() {
     if timing {
         let el = t0.elapsed().as_secs_f64();
         let _ = el;
-        let names = ["dedup", "map", "clk2", "group", "clk3", "person", "cksort", "name"];
+        let names = ["dedup", "map", "clk2", "group", "clk3", "person", "gloop", "radix"];
         let mut line = String::from("phases(Mcyc, all threads)");
         for (i, n) in names.iter().enumerate() {
             line.push_str(&format!(" {}={}", n, PHASE[i].load(Relaxed) / 1_000_000));
