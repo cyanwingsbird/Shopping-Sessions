@@ -1008,6 +1008,8 @@ const RELEASE: bool = true;
 const NAMECP: bool = true;
 /// stage 1: ISO ts with an offset parsed with ingest_ts in the same SIMD pass as the Z form
 const ISOM: bool = true;
+/// stage 3: each person's clicks sorted on their own (insertion sort when few) instead of a partition radix
+const CKINS: bool = true;
 /// stage 1: campaign ids of up to 8 bytes looked up by their bytes
 const CAMPS: bool = true;
 /// stage 2: persons of a partition kept in a side array (stage-1 records not written)
@@ -2249,6 +2251,9 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
     ctmp.clear();
     let mut ncl = 0usize;
     if nc > 0 {
+        cgids.reserve(nc);
+        ctmp.reserve(nc);
+        let (cgp, ctp) = (cgids.as_mut_ptr(), ctmp.as_mut_ptr());
         for &(cp, cl) in cs.iter() {
             for r in std::slice::from_raw_parts(cp, cl) {
                 let k = r.user;
@@ -2264,20 +2269,22 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
                     idx = (idx + 1) & gt.mask;
                 };
                 if g != u32::MAX {
-                    cgids.push(g);
-                    ctmp.push((r.ts, (r.pc & 0xFFFF) as u32, r.pc >> 16));
+                    *cgp.add(ncl) = g;
+                    *ctp.add(ncl) = (r.ts, (r.pc & 0xFFFF) as u32, r.pc >> 16);
                     *coff.get_unchecked_mut(g as usize) += 1;
                     ncl += 1;
                 }
             }
         }
+        cgids.set_len(ncl);
+        ctmp.set_len(ncl);
         let mut acc = 0u32;
         for x in coff.iter_mut() {
             let c = *x;
             *x = acc;
             acc += c;
         }
-        if CKRADIX && ncl > 1 {
+        if CKRADIX && !CKINS && ncl > 1 {
             // order by ts first (LSD radix, 4 x 8 bits, stable), so that the stable placement
             // by person below leaves every person's clicks sorted by ts
             ctmp2.clear();
@@ -2352,6 +2359,22 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
         }
         let tq0 = if PHASE_FINE { tsc() } else { 0 };
         let ck = &mut cks[coff[g] as usize..coff[g + 1] as usize];
+        if CKINS && ck.len() > 1 {
+            // a person's clicks by ts (equal ts in any order: ties go to the smallest click_id below)
+            if ck.len() <= 24 {
+                for i in 1..ck.len() {
+                    let v = *ck.get_unchecked(i);
+                    let mut j = i;
+                    while j > 0 && ck.get_unchecked(j - 1).0 > v.0 {
+                        *ck.get_unchecked_mut(j) = *ck.get_unchecked(j - 1);
+                        j -= 1;
+                    }
+                    *ck.get_unchecked_mut(j) = v;
+                }
+            } else {
+                ck.sort_unstable_by_key(|c| c.0);
+            }
+        }
         if !CKRADIX && ck.len() > 1 {
             ck.sort_unstable_by(|a, b| {
                 a.0.cmp(&b.0).then_with(|| {
@@ -2553,7 +2576,7 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
                 if hi > lo {
                     let j = hi - 1;
                     camp = ck.get_unchecked(j).1 as usize;
-                    if CKRADIX && j > lo && ck.get_unchecked(j - 1).0 == ck.get_unchecked(j).0 {
+                    if (CKRADIX || CKINS) && j > lo && ck.get_unchecked(j - 1).0 == ck.get_unchecked(j).0 {
                         // clicks at the same ms: the smallest click_id
                         let t = ck.get_unchecked(j).0;
                         let mut best = j;
