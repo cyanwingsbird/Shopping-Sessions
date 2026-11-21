@@ -2124,9 +2124,9 @@ fn main() {
     let est_ev = ev_bytes / 72 + 1;
     let est_ck = ck_bytes / 44 + 1;
     let pow2 = |x: usize, lo: usize, hi: usize| x.next_power_of_two().clamp(lo, hi);
-    let p1 = envn("SS_P1").unwrap_or_else(|| pow2(est_ev / 32768, 1, 1024));
+    let p1 = envn("SS_P1").unwrap_or_else(|| pow2(est_ev / 32768, 1, 4096));
     let p1c = envn("SS_P1C").unwrap_or_else(|| pow2(est_ck / 65536, 1, 128));
-    let q = envn("SS_Q").unwrap_or_else(|| pow2(est_ev / 32768, 1, 1024));
+    let q = envn("SS_Q").unwrap_or_else(|| pow2(est_ev / 32768, 1, 4096));
 
     // ---- shared state
     let ev1: Vec<Sh<Vec<Vec<Rec>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
@@ -2137,6 +2137,7 @@ fn main() {
     let assists: Vec<Sh<Vec<u32>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let linkmap: Sh<LinkMap> = Sh::new(LinkMap { mask: 0, nb: 1, slots: vec![LB0], ovf: vec![0], names: vec![LSlot { key: 0, person: 0 }], nmask: 0, filt: vec![0], fmask: 0, empty: LB0 });
     let next_chunk = AtomicUsize::new(0);
+    let links_ready = std::sync::atomic::AtomicBool::new(false);
     let next_p1 = AtomicUsize::new(0);
     let next_q = AtomicUsize::new(0);
     let barrier = Barrier::new(nthreads);
@@ -2150,6 +2151,7 @@ fn main() {
         for tid in 0..nthreads {
             let (chunks, ev1, ck1, ev2, ck2, cells, linkmap, assists) = (&chunks, &ev1, &ck1, &ev2, &ck2, &cells, &linkmap, &assists);
             let (next_chunk, next_p1, next_q, barrier) = (&next_chunk, &next_p1, &next_q, &barrier);
+            let links_ready = &links_ready;
             let (prod_tab, camp_tab, ln_segs, cat_names, cat_rank, out_dir) = (&prod_tab, &camp_tab, &ln_segs, &cat_names, &cat_rank, &out_dir);
             let body = move || unsafe {
                 let mut perf = Perf::open(perf_on);
@@ -2181,6 +2183,7 @@ fn main() {
                     }
                     let tl = t0.elapsed();
                     *linkmap.get() = build_links(&raw);
+                    links_ready.store(true, std::sync::atomic::Ordering::Release);
                     if timing {
                         eprintln!("links parsed {:?}", tl);
                     }
@@ -2199,6 +2202,13 @@ fn main() {
                 let mut wc1: Wc<Rec, 4> = Wc::new(p1);
                 let mut nlbuf: Vec<u32> = vec![0u32; SCAN + 64];
                 let mut wcc1: Wc<RecC, 8> = Wc::new(p1c);
+                // clicks need no dedup (copies are identical): their chunks come last in stage 1, when the
+                // links are ready, so they are mapped to persons and scattered by person right away
+                let ck_direct = !click_dedup;
+                let c2 = ck2[tid].get();
+                *c2 = (0..q).map(|_| Vec::with_capacity(est_ck / (q * nthreads) * 5 / 4 + 64)).collect();
+                let mut wcc2: Wc<RecC, 8> = Wc::new(q);
+                let mut lm1: Option<&LinkMap> = None;
                 // SS_REPEAT=n (single thread, parse benchmark): run the chunk loop n times, report each
                 let mut rep_left = repeat;
                 let mut rep_t = Instant::now();
@@ -2392,6 +2402,23 @@ fn main() {
                                 None => continue,
                             };
                             let uh = hash(p.add(f1), l1);
+                            if ck_direct {
+                                let lmr = match lm1 {
+                                    Some(l) => l,
+                                    None => {
+                                        while !links_ready.load(std::sync::atomic::Ordering::Acquire) {
+                                            std::hint::spin_loop();
+                                        }
+                                        let l: &LinkMap = linkmap.get();
+                                        lm1 = Some(l);
+                                        l
+                                    }
+                                };
+                                let pu = if lmr.mask != 0 { lmr.map(uh).0 } else { uh };
+                                let part = (((pu >> 32) * q as u64) >> 32) as usize;
+                                wcc2.push(c2, part, RecC { user: pu, pc: ((line as u64) << 16) | camp as u64, ts: (t - base_ms) as u32, kh: 0 });
+                                continue;
+                            }
                             // clicks are only deduplicated under SS_CLICK_DEDUP (see stage 2); otherwise
                             // partition by user and skip hashing click_id (ties use the id bytes directly)
                             let h = if click_dedup { hash(p.add(f0), l0) } else { uh };
@@ -2408,6 +2435,9 @@ fn main() {
                 }
                 wc1.finish(evb);
                 wcc1.finish(ckb);
+                if ck_direct {
+                    wcc2.finish(c2);
+                }
                 perf.stage(0);
                 barrier.wait();
                 if timing && tid == 0 {
@@ -2417,17 +2447,14 @@ fn main() {
                 let lm: &LinkMap = linkmap.get();
                 let has_links = lm.mask != 0 && abl != 5;
                 let e2 = ev2[tid].get();
-                let c2 = ck2[tid].get();
                 *e2 = (0..q).map(|_| Vec::with_capacity(est_ev / (q * nthreads) * 5 / 4 + 64)).collect();
-                *c2 = (0..q).map(|_| Vec::with_capacity(est_ck / (q * nthreads) * 5 / 4 + 64)).collect();
                 let mut table: Vec<u64> = Vec::new();
                 let mut table32: Vec<u32> = Vec::new();
                 let mut wc2: Wc<Rec2, 8> = Wc::new(q);
                 let mut ph = [0u64; 8];
-                let mut wcc2: Wc<RecC, 8> = Wc::new(q);
                 loop {
                     let pi = next_p1.fetch_add(1, Relaxed);
-                    if pi >= p1 + p1c {
+                    if pi >= p1 + if ck_direct { 0 } else { p1c } {
                         break;
                     }
                     if pi < p1 {
@@ -2642,7 +2669,9 @@ fn main() {
                     }
                 }
                 wc2.finish(e2);
-                wcc2.finish(c2);
+                if !ck_direct {
+                    wcc2.finish(c2);
+                }
                 perf.stage(1);
                 barrier.wait();
                 if timing && tid == 0 {
