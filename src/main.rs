@@ -37,6 +37,7 @@ thread_local! {
     static ARENA: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 unsafe fn arena_alloc(size: usize, align: usize) -> *mut u8 {
+    let align = align.max(64);
     ARENA.with(|a| {
         let (mut cur, mut end) = a.get();
         let mut p = (cur + align - 1) & !(align - 1);
@@ -126,6 +127,57 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
 }
 #[global_allocator]
 static GLOBAL: HugeAlloc = HugeAlloc;
+
+/// Software write-combining for scattering records into many partitions: each partition stages K
+/// records (a whole number of 64-byte lines) and writes them out with non-temporal stores, so the
+/// destination lines are never read for ownership.
+struct Wc<T: Copy, const K: usize> {
+    buf: Vec<[T; K]>,
+    cnt: Vec<u32>,
+}
+impl<T: Copy, const K: usize> Wc<T, K> {
+    fn new(n: usize) -> Self {
+        Wc { buf: vec![unsafe { std::mem::zeroed() }; n], cnt: vec![0; n] }
+    }
+    #[inline(always)]
+    unsafe fn push(&mut self, outs: &mut [Vec<T>], part: usize, v: T) {
+        let c = *self.cnt.get_unchecked(part) as usize;
+        *self.buf.get_unchecked_mut(part).get_unchecked_mut(c) = v;
+        if c + 1 < K {
+            *self.cnt.get_unchecked_mut(part) = (c + 1) as u32;
+            return;
+        }
+        *self.cnt.get_unchecked_mut(part) = 0;
+        let o = outs.get_unchecked_mut(part);
+        if o.capacity() - o.len() < K {
+            o.reserve(K.max(o.len() / 2));
+        }
+        let dst = o.as_mut_ptr().add(o.len()) as *mut u8;
+        let src = self.buf.get_unchecked(part).as_ptr() as *const u8;
+        let bytes = std::mem::size_of::<[T; K]>();
+        if (dst as usize) & 31 == 0 && bytes % 32 == 0 {
+            let mut i = 0;
+            while i < bytes {
+                _mm256_stream_si256(dst.add(i) as *mut __m256i, _mm256_loadu_si256(src.add(i) as *const __m256i));
+                i += 32;
+            }
+        } else {
+            std::ptr::copy_nonoverlapping(src, dst, bytes);
+        }
+        o.set_len(o.len() + K);
+    }
+    /// Write out the partially filled stages and order the streaming stores before other threads read.
+    unsafe fn finish(&mut self, outs: &mut [Vec<T>]) {
+        for (part, o) in outs.iter_mut().enumerate() {
+            let c = self.cnt[part] as usize;
+            if c > 0 {
+                o.extend_from_slice(&self.buf[part][..c]);
+                self.cnt[part] = 0;
+            }
+        }
+        _mm_sfence();
+    }
+}
 
 struct Sh<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for Sh<T> {}
@@ -1635,6 +1687,7 @@ fn main() {
                 *ckb = (0..p1c).map(|_| Vec::with_capacity(est_ck / (p1c * nthreads) * 17 / 16 + 64)).collect();
                 let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
                 let mut abl_sink = 0u64;
+                let mut wc1: Wc<Rec, 2> = Wc::new(p1);
                 loop {
                     let ci = next_chunk.fetch_add(1, Relaxed);
                     if ci >= chunks.len() {
@@ -1712,7 +1765,7 @@ fn main() {
                                 rec.ts = (t - base_ms) as u32;
                             }
                             if abl == 3 { abl_sink += rec.user + rec.ts as u64; continue; }
-                            evb.get_unchecked_mut(part).push(rec);
+                            wc1.push(evb, part, rec);
                         }
                     } else {
                         while s < c.b {
@@ -1747,6 +1800,7 @@ fn main() {
                         }
                     }
                 }
+                wc1.finish(evb);
                 barrier.wait();
                 if timing && tid == 0 {
                     eprintln!("stage1 done {:?} {}", t0.elapsed(), abl_sink);
@@ -1759,6 +1813,7 @@ fn main() {
                 *e2 = (0..q).map(|_| Vec::with_capacity(est_ev / (q * nthreads) * 5 / 4 + 64)).collect();
                 *c2 = (0..q).map(|_| Vec::with_capacity(est_ck / (q * nthreads) * 5 / 4 + 64)).collect();
                 let mut table: Vec<u64> = Vec::new();
+                let mut wc2: Wc<Rec2, 8> = Wc::new(q);
                 loop {
                     let pi = next_p1.fetch_add(1, Relaxed);
                     if pi >= p1 + p1c {
@@ -1835,7 +1890,7 @@ fn main() {
                                 }
                                 let part = (((o.user >> 32) * q as u64) >> 32) as usize;
                                 if abl == 7 { abl_sink += o.user; continue; }
-                                e2.get_unchecked_mut(part).push(o);
+                                wc2.push(e2, part, o);
                             }
                         }
                     } else {
@@ -1914,6 +1969,7 @@ fn main() {
                         }
                     }
                 }
+                wc2.finish(e2);
                 barrier.wait();
                 if timing && tid == 0 {
                     eprintln!("stage2 done {:?} {}", t0.elapsed(), abl_sink);
