@@ -1621,7 +1621,7 @@ fn main() {
     let est_ev = ev_bytes / 72 + 1;
     let est_ck = ck_bytes / 44 + 1;
     let pow2 = |x: usize, lo: usize, hi: usize| x.next_power_of_two().clamp(lo, hi);
-    let p1 = envn("SS_P1").unwrap_or_else(|| pow2(est_ev / 65536, 1, 512));
+    let p1 = envn("SS_P1").unwrap_or_else(|| pow2(est_ev / 32768, 1, 1024));
     let p1c = envn("SS_P1C").unwrap_or_else(|| pow2(est_ck / 65536, 1, 128));
     let q = envn("SS_Q").unwrap_or_else(|| pow2(est_ev / 32768, 1, 1024));
 
@@ -1688,6 +1688,7 @@ fn main() {
                 let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
                 let mut abl_sink = 0u64;
                 let mut wc1: Wc<Rec, 2> = Wc::new(p1);
+                let mut wcc1: Wc<RecC, 8> = Wc::new(p1c);
                 loop {
                     let ci = next_chunk.fetch_add(1, Relaxed);
                     if ci >= chunks.len() {
@@ -1791,7 +1792,7 @@ fn main() {
                             };
                             let h = hash(p.add(f0), l0);
                             let part = (((h >> 32) * p1c as u64) >> 32) as usize;
-                            ckb.get_unchecked_mut(part).push(RecC {
+                            wcc1.push(ckb, part, RecC {
                                 user: hash(p.add(f1), l1),
                                 pc: ((line as u64) << 16) | camp as u64,
                                 ts: (t - base_ms) as u32,
@@ -1801,6 +1802,7 @@ fn main() {
                     }
                 }
                 wc1.finish(evb);
+                wcc1.finish(ckb);
                 barrier.wait();
                 if timing && tid == 0 {
                     eprintln!("stage1 done {:?} {}", t0.elapsed(), abl_sink);
@@ -1813,7 +1815,9 @@ fn main() {
                 *e2 = (0..q).map(|_| Vec::with_capacity(est_ev / (q * nthreads) * 5 / 4 + 64)).collect();
                 *c2 = (0..q).map(|_| Vec::with_capacity(est_ck / (q * nthreads) * 5 / 4 + 64)).collect();
                 let mut table: Vec<u64> = Vec::new();
+                let mut table32: Vec<u32> = Vec::new();
                 let mut wc2: Wc<Rec2, 8> = Wc::new(q);
+                let mut wcc2: Wc<RecC, 8> = Wc::new(q);
                 loop {
                     let pi = next_p1.fetch_add(1, Relaxed);
                     if pi >= p1 + p1c {
@@ -1829,8 +1833,10 @@ fn main() {
                         let n: usize = slices.iter().map(|s| s.1).sum();
                         let cap = (n * 2).next_power_of_two().max(16);
                         let mask = cap - 1;
-                        table.clear();
-                        table.resize(cap, 0);
+                        if n >= (1 << 20) - 1 {
+                            table.clear();
+                            table.resize(cap, 0);
+                        }
                         let resolve = |gi: usize| -> *mut Rec {
                             let mut g = gi;
                             for s in &slices {
@@ -1842,34 +1848,72 @@ fn main() {
                             unreachable!()
                         };
                         let mut gi = 0usize;
-                        for s in &slices {
-                            if abl == 6 { break; }
-                            for i in 0..s.1 {
-                                let r = &mut *s.0.add(i);
-                                let h24 = r.eh & 0xFFFF_FFFF;
-                                let mut idx = h24 as usize & mask;
-                                loop {
-                                    let e = *table.get_unchecked(idx);
-                                    if e == 0 {
-                                        *table.get_unchecked_mut(idx) = (h24 << 32) | (gi as u64 + 1);
-                                        break;
-                                    }
-                                    if e >> 32 == h24 {
-                                        let o = &mut *resolve((e as u32 - 1) as usize);
-                                        if o.eh == r.eh {
-                                            if (r.ic >> 8) < (o.ic >> 8) {
-                                                o.ts = DEAD;
-                                                *table.get_unchecked_mut(idx) = (h24 << 32) | (gi as u64 + 1);
-                                            } else {
-                                                r.ts = DEAD;
-                                            }
+                        if n < (1 << 20) - 1 {
+                            // compact table: 12-bit tag << 20 | record index + 1 (fits L2 for typical partitions)
+                            table32.clear();
+                            table32.resize(cap, 0);
+                            for s in &slices {
+                                if abl == 6 {
+                                    break;
+                                }
+                                for i in 0..s.1 {
+                                    let r = &mut *s.0.add(i);
+                                    let tag = ((r.eh >> 32) & 0xFFF) as u32;
+                                    let mut idx = r.eh as usize & mask;
+                                    loop {
+                                        let e = *table32.get_unchecked(idx);
+                                        if e == 0 {
+                                            *table32.get_unchecked_mut(idx) = (tag << 20) | (gi as u32 + 1);
                                             break;
                                         }
+                                        if e >> 20 == tag {
+                                            let o = &mut *resolve(((e & 0xF_FFFF) - 1) as usize);
+                                            if o.eh == r.eh {
+                                                if (r.ic >> 8) < (o.ic >> 8) {
+                                                    o.ts = DEAD;
+                                                    *table32.get_unchecked_mut(idx) = (tag << 20) | (gi as u32 + 1);
+                                                } else {
+                                                    r.ts = DEAD;
+                                                }
+                                                break;
+                                            }
+                                        }
+                                        idx = (idx + 1) & mask;
                                     }
-                                    idx = (idx + 1) & mask;
+                                    gi += 1;
                                 }
-                                gi += 1;
                             }
+                        } else {
+                            for s in &slices {
+                                if abl == 6 { break; }
+                                for i in 0..s.1 {
+                                    let r = &mut *s.0.add(i);
+                                    let h24 = r.eh & 0xFFFF_FFFF;
+                                    let mut idx = h24 as usize & mask;
+                                    loop {
+                                        let e = *table.get_unchecked(idx);
+                                        if e == 0 {
+                                            *table.get_unchecked_mut(idx) = (h24 << 32) | (gi as u64 + 1);
+                                            break;
+                                        }
+                                        if e >> 32 == h24 {
+                                            let o = &mut *resolve((e as u32 - 1) as usize);
+                                            if o.eh == r.eh {
+                                                if (r.ic >> 8) < (o.ic >> 8) {
+                                                    o.ts = DEAD;
+                                                    *table.get_unchecked_mut(idx) = (h24 << 32) | (gi as u64 + 1);
+                                                } else {
+                                                    r.ts = DEAD;
+                                                }
+                                                break;
+                                            }
+                                        }
+                                        idx = (idx + 1) & mask;
+                                    }
+                                    gi += 1;
+                                }
+                            }
+
                         }
                         for s in &slices {
                             let recs = std::slice::from_raw_parts(s.0, s.1);
@@ -1964,12 +2008,13 @@ fn main() {
                                     }
                                 }
                                 let part = (((r.user >> 32) * q as u64) >> 32) as usize;
-                                c2.get_unchecked_mut(part).push(r);
+                                wcc2.push(c2, part, r);
                             }
                         }
                     }
                 }
                 wc2.finish(e2);
+                wcc2.finish(c2);
                 barrier.wait();
                 if timing && tid == 0 {
                     eprintln!("stage2 done {:?} {}", t0.elapsed(), abl_sink);
