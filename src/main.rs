@@ -28,6 +28,35 @@ extern "C" {
 /// Large allocations go straight to mmap with transparent huge pages; small ones to the system allocator.
 struct HugeAlloc;
 const HUGE_MIN: usize = 1 << 20;
+/// Medium blocks (partition buffers) are bump-allocated from a per-thread huge-page arena and never freed:
+/// the process exits with _exit, and these buffers live for the whole run anyway.
+const ARENA_MIN: usize = 16 << 10;
+const ARENA_CHUNK: usize = 64 << 20;
+thread_local! {
+    static ARENA: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+unsafe fn arena_alloc(size: usize, align: usize) -> *mut u8 {
+    ARENA.with(|a| {
+        let (mut cur, mut end) = a.get();
+        let mut p = (cur + align - 1) & !(align - 1);
+        if cur == 0 || p + size > end {
+            let m = mmap(std::ptr::null_mut(), ARENA_CHUNK, 3, 0x22 | MAP_NORESERVE, -1, 0);
+            if m as isize == -1 {
+                return std::ptr::null_mut();
+            }
+            madvise(m, ARENA_CHUNK, 14);
+            cur = m as usize;
+            end = cur + ARENA_CHUNK;
+            p = (cur + align - 1) & !(align - 1);
+        }
+        a.set((p + size, end));
+        p as *mut u8
+    })
+}
+#[inline(always)]
+fn in_arena(l: &std::alloc::Layout) -> bool {
+    l.size() >= ARENA_MIN && l.size() < HUGE_MIN && l.align() <= 4096
+}
 const HP: usize = 2 << 20;
 #[inline(always)]
 fn hround(n: usize) -> usize {
@@ -43,6 +72,8 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
             }
             madvise(p, n, 14);
             p
+        } else if in_arena(&l) {
+            arena_alloc(l.size(), l.align())
         } else {
             std::alloc::System.alloc(l)
         }
@@ -50,6 +81,12 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
     unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
         if l.size() >= HUGE_MIN && l.align() <= 4096 {
             self.alloc(l)
+        } else if in_arena(&l) {
+            let p = arena_alloc(l.size(), l.align());
+            if !p.is_null() {
+                std::ptr::write_bytes(p, 0, l.size());
+            }
+            p
         } else {
             std::alloc::System.alloc_zeroed(l)
         }
@@ -57,6 +94,8 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
     unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
         if l.size() >= HUGE_MIN && l.align() <= 4096 {
             munmap(p, hround(l.size()));
+        } else if in_arena(&l) {
+            // arena memory is never returned
         } else {
             std::alloc::System.dealloc(p, l)
         }
@@ -344,6 +383,7 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
 /// Split the line starting at p (at most maxlen bytes before EOF) into nf fields.
 /// Returns (line length without newline, ok). Field bounds are relative to p, quotes stripped.
 #[inline(always)]
+#[allow(dead_code)]
 unsafe fn split(p: *const u8, maxlen: usize, nf: usize, st: &mut [u32; 8], en: &mut [u32; 8]) -> (usize, bool) {
     let (nl0, c0, q0) = masks64(p);
     let (len, cm, qm): (usize, u128, u128);
@@ -409,6 +449,54 @@ unsafe fn split(p: *const u8, maxlen: usize, nf: usize, st: &mut [u32; 8], en: &
         }
     }
     (len, true)
+}
+
+/// Branch-free split of the line at p into NF fields (bounds relative to p, quotes stripped).
+/// Returns (line length without newline, ok). Lines of 128+ bytes take the slow path.
+#[inline(always)]
+unsafe fn splitn<const NF: usize>(p: *const u8, maxlen: usize, st: &mut [u32; 8], en: &mut [u32; 8]) -> (usize, bool) {
+    let (nl0, c0, q0) = masks64(p);
+    let (nl1, c1, q1) = masks64(p.add(64));
+    let nl = ((nl1 as u128) << 64) | nl0 as u128;
+    let l = (nl.trailing_zeros() as usize).min(maxlen);
+    if l >= 128 {
+        return split_slow(p, maxlen, NF, st, en);
+    }
+    let m = (1u128 << l) - 1;
+    let mut cm = (((c1 as u128) << 64) | c0 as u128) & m;
+    let qm = (((q1 as u128) << 64) | q0 as u128) & m;
+    if cm.count_ones() as usize != NF - 1 {
+        return (l, false);
+    }
+    let mut a = 0u32;
+    for k in 0..NF - 1 {
+        let c = cm.trailing_zeros();
+        *st.get_unchecked_mut(k) = a;
+        *en.get_unchecked_mut(k) = c;
+        a = c + 1;
+        cm &= cm - 1;
+    }
+    *st.get_unchecked_mut(NF - 1) = a;
+    *en.get_unchecked_mut(NF - 1) = l as u32;
+    let nq = qm.count_ones();
+    if nq != 0 {
+        let mut cnt = 0u32;
+        for k in 0..NF {
+            let (s, e) = (*st.get_unchecked(k), *en.get_unchecked(k));
+            // a field is quoted iff it is at least 2 long and starts and ends with a quote
+            let ok2 = (e >= s + 2) as u32;
+            let qs = (*p.add(s as usize) == b'"') as u32;
+            let qe = (*p.add((e as usize).saturating_sub(1).max(s as usize)) == b'"') as u32;
+            let strip = ok2 & qs & qe;
+            *st.get_unchecked_mut(k) = s + strip;
+            *en.get_unchecked_mut(k) = e - strip;
+            cnt += strip * 2;
+        }
+        if cnt != nq {
+            return (l, false);
+        }
+    }
+    (l, true)
 }
 
 #[cold]
@@ -1006,6 +1094,7 @@ fn main() {
     };
     init_daytab();
     let timing = std::env::var("SS_TIMING").is_ok();
+    let prefault = std::env::var("SS_NOPREFAULT").is_err();
     let abl: usize = std::env::var("SS_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(99);
     let envn = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
     let nthreads = envn("SS_THREADS")
@@ -1166,7 +1255,7 @@ fn main() {
                         s += 1;
                         while s < seg.end {
                             let p = base().add(s);
-                            let (len, ok) = split(p, seg.end - s, 2, &mut st, &mut en);
+                            let (len, ok) = splitn::<2>(p, seg.end - s, &mut st, &mut en);
                             if ok && en[0] > st[0] && en[1] > st[1] {
                                 let (la, lb) = ((en[0] - st[0]) as usize, (en[1] - st[1]) as usize);
                                 raw.push(LinkRaw {
@@ -1197,6 +1286,12 @@ fn main() {
                         break;
                     }
                     let c = chunks[ci];
+                    if prefault {
+                        // map the chunk's page-cache pages in one call instead of one fault per 4 KB page
+                        let pa = (c.a & !4095) as usize;
+                        let pe = (c.b + 4095).min(c.fe + 4095) & !4095;
+                        madvise(base().add(pa) as *mut u8, pe - pa, 22);
+                    }
                     let mut s = c.a;
                     // first line start in this chunk
                     {
@@ -1209,7 +1304,7 @@ fn main() {
                     if c.kind == 0 {
                         while s < c.b {
                             let p = base().add(s);
-                            let (len, ok) = split(p, c.fe - s, 7, &mut st, &mut en);
+                            let (len, ok) = splitn::<7>(p, c.fe - s, &mut st, &mut en);
                             let line = s;
                             s += len + 1;
                             if !ok || en[0] == st[0] || abl == 1 {
@@ -1262,7 +1357,7 @@ fn main() {
                     } else {
                         while s < c.b {
                             let p = base().add(s);
-                            let (len, ok) = split(p, c.fe - s, 4, &mut st, &mut en);
+                            let (len, ok) = splitn::<4>(p, c.fe - s, &mut st, &mut en);
                             let line = s;
                             s += len + 1;
                             if !ok || en[0] == st[0] || en[1] == st[1] {
