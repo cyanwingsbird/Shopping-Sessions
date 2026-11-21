@@ -294,7 +294,102 @@ unsafe fn parse_dt(p: *const u8) -> i64 {
     };
     days * 86400 + (h * 3600 + mi * 60 + s) as i64
 }
-/// Returns epoch ms or BAD
+/// SIMD "YYYY-MM-DDTHH:MM:SS" at p -> epoch seconds or BAD. Reads p[0..19].
+#[inline(always)]
+unsafe fn parse_dt_simd(p: *const u8) -> i64 {
+    let a = _mm_loadu_si128(p as *const __m128i);
+    let b = _mm_loadu_si128(p.add(3) as *const __m128i);
+    // separators p[4]='-', p[7]='-', p[10]='T', p[13]=':', p[16]=':' are b[1], b[4], b[7], b[10], b[13]
+    let sep = _mm_setr_epi8(0, b'-' as i8, 0, 0, b'-' as i8, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0, b':' as i8, 0, 0);
+    let sepok = (_mm_movemask_epi8(_mm_cmpeq_epi8(b, sep)) & 0x2492) == 0x2492;
+    let da = _mm_shuffle_epi8(a, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -128, -128, -128, -128));
+    let db = _mm_shuffle_epi8(b, _mm_setr_epi8(-128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, 14, 15, -128, -128));
+    let v = _mm_sub_epi8(_mm_or_si128(da, db), _mm_set1_epi8(b'0' as i8));
+    let nine = _mm_set1_epi8(9);
+    let digok = (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(v, nine), nine)) & 0x3FFF) == 0x3FFF;
+    if !(sepok & digok) {
+        return BAD;
+    }
+    let pr = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));
+    let y = (_mm_extract_epi16::<0>(pr) * 100 + _mm_extract_epi16::<1>(pr)) as u32;
+    let mo = _mm_extract_epi16::<2>(pr) as u32;
+    let d = _mm_extract_epi16::<3>(pr) as u32;
+    let h = _mm_extract_epi16::<4>(pr) as u32;
+    let mi = _mm_extract_epi16::<5>(pr) as u32;
+    let s = _mm_extract_epi16::<6>(pr) as u32;
+    if h > 23 || mi > 59 || s > 59 || mo > 12 || d > 31 {
+        return BAD;
+    }
+    let days = if (2000..2064).contains(&y) {
+        let v = *DAYTAB.get_unchecked(((y - 2000) * 512 + mo * 32 + d) as usize);
+        if v == i32::MIN {
+            return BAD;
+        }
+        v as i64
+    } else {
+        return parse_dt(p);
+    };
+    days * 86400 + (h * 3600 + mi * 60 + s) as i64
+}
+/// Lane masks: LANES[n] keeps the top n lanes of a 16-byte vector.
+static LANES: [[u8; 16]; 17] = {
+    let mut t = [[0u8; 16]; 17];
+    let mut n = 0;
+    while n <= 16 {
+        let mut i = 16 - n;
+        while i < 16 {
+            t[n][i] = 0xFF;
+            i += 1;
+        }
+        n += 1;
+    }
+    t
+};
+/// epoch ms (or BAD) of a ts field. F3 values of up to 16 characters are parsed with SIMD; the
+/// field must be preceded by at least 16 readable bytes (true for any data line: the header is longer).
+#[inline(always)]
+unsafe fn parse_ts_fast(p: *const u8, len: usize) -> i64 {
+    if len == 20 {
+        if *p.add(19) != b'Z' {
+            return parse_ts(p, len);
+        }
+        let s = parse_dt_simd(p);
+        return if s == BAD { BAD } else { s * 1000 };
+    }
+    if len == 25 {
+        let sg = *p.add(19);
+        if sg != b'+' && sg != b'-' {
+            return parse_ts(p, len);
+        }
+        let s = parse_dt_simd(p);
+        let (oh, b1) = dig2(p.add(20));
+        let (om, b2) = dig2(p.add(23));
+        if s == BAD || (b1 | b2) != 0 || *p.add(22) != b':' || oh > 23 || om > 59 {
+            return BAD;
+        }
+        let off = (oh * 3600 + om * 60) as i64;
+        return if sg == b'+' { (s - off) * 1000 } else { (s + off) * 1000 };
+    }
+    if len == 0 || len > 16 {
+        return parse_ts(p, len);
+    }
+    // right-aligned digits in one vector
+    let x = _mm_loadu_si128(p.add(len).sub(16) as *const __m128i);
+    let keep = _mm_loadu_si128(LANES[len].as_ptr() as *const __m128i);
+    let v = _mm_and_si128(_mm_sub_epi8(x, _mm_set1_epi8(b'0' as i8)), keep);
+    let nine = _mm_set1_epi8(9);
+    if _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(v, nine), nine)) != 0xFFFF {
+        return BAD;
+    }
+    let t1 = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));
+    let t2 = _mm_madd_epi16(t1, _mm_set1_epi32(0x0001_0064));
+    let t3 = _mm_packus_epi32(t2, t2);
+    let t4 = _mm_madd_epi16(t3, _mm_set1_epi32(0x0001_2710));
+    let hi = _mm_cvtsi128_si32(t4) as u32 as i64;
+    let lo = _mm_extract_epi32::<1>(t4) as u32 as i64;
+    hi * 100_000_000 + lo
+}
+/// Returns epoch ms or BAD (scalar reference implementation)
 #[inline(always)]
 unsafe fn parse_ts(p: *const u8, len: usize) -> i64 {
     if len == 20 && *p.add(19) == b'Z' {
@@ -451,7 +546,9 @@ unsafe fn split(p: *const u8, maxlen: usize, nf: usize, st: &mut [u32; 8], en: &
     (len, true)
 }
 
-/// Branch-free split of the line at p into NF fields (bounds relative to p, quotes stripped).
+/// Split the line at p into NF fields (bounds relative to p, quotes stripped).
+/// Quoting is validated with whole-line mask arithmetic: every quote must open or close a field,
+/// a field is quoted iff it starts and ends with a quote, and a quoted field is at least 2 long.
 /// Returns (line length without newline, ok). Lines of 128+ bytes take the slow path.
 #[inline(always)]
 unsafe fn splitn<const NF: usize>(p: *const u8, maxlen: usize, st: &mut [u32; 8], en: &mut [u32; 8]) -> (usize, bool) {
@@ -462,38 +559,40 @@ unsafe fn splitn<const NF: usize>(p: *const u8, maxlen: usize, st: &mut [u32; 8]
     if l >= 128 {
         return split_slow(p, maxlen, NF, st, en);
     }
-    let m = (1u128 << l) - 1;
-    let mut cm = (((c1 as u128) << 64) | c0 as u128) & m;
-    let qm = (((q1 as u128) << 64) | q0 as u128) & m;
-    if cm.count_ones() as usize != NF - 1 {
+    let lm = (1u128 << l) - 1;
+    let c = (((c1 as u128) << 64) | c0 as u128) & lm;
+    let q = (((q1 as u128) << 64) | q0 as u128) & lm;
+    if c.count_ones() as usize != NF - 1 {
         return (l, false);
     }
+    if q != 0 {
+        let d = c | (1u128 << l); // separators including the line end
+        let s = ((c << 1) | 1) & lm; // first byte of each field
+        let e = (d >> 1) & !c & lm; // last byte of each non-empty field
+        let qs = q & s;
+        let qe = q & e;
+        let t = d & !(d.wrapping_sub(qs)); // separator closing each field that opens with a quote
+        if q != (qs | qe) || (q & s & e) != 0 || qe != (t >> 1) {
+            return (l, false);
+        }
+    }
+    let mut cm = c;
     let mut a = 0u32;
     for k in 0..NF - 1 {
-        let c = cm.trailing_zeros();
+        let x = cm.trailing_zeros();
         *st.get_unchecked_mut(k) = a;
-        *en.get_unchecked_mut(k) = c;
-        a = c + 1;
+        *en.get_unchecked_mut(k) = x;
+        a = x + 1;
         cm &= cm - 1;
     }
     *st.get_unchecked_mut(NF - 1) = a;
     *en.get_unchecked_mut(NF - 1) = l as u32;
-    let nq = qm.count_ones();
-    if nq != 0 {
-        let mut cnt = 0u32;
+    if q != 0 {
         for k in 0..NF {
-            let (s, e) = (*st.get_unchecked(k), *en.get_unchecked(k));
-            // a field is quoted iff it is at least 2 long and starts and ends with a quote
-            let ok2 = (e >= s + 2) as u32;
-            let qs = (*p.add(s as usize) == b'"') as u32;
-            let qe = (*p.add((e as usize).saturating_sub(1).max(s as usize)) == b'"') as u32;
-            let strip = ok2 & qs & qe;
-            *st.get_unchecked_mut(k) = s + strip;
-            *en.get_unchecked_mut(k) = e - strip;
-            cnt += strip * 2;
-        }
-        if cnt != nq {
-            return (l, false);
+            let (s0, e0) = (*st.get_unchecked(k), *en.get_unchecked(k));
+            let f = (s0 < e0 && *p.add(s0 as usize) == b'"') as u32;
+            *st.get_unchecked_mut(k) = s0 + f;
+            *en.get_unchecked_mut(k) = e0 - f;
         }
     }
     (l, true)
@@ -577,9 +676,7 @@ impl StrTable {
         StrTable { mask: cap - 1, slots: vec![(0, 0, 0, 0); cap], bytes: Vec::new() }
     }
     fn insert(&mut self, k: &[u8], v: u32) {
-        let mut padded = k.to_vec();
-        padded.extend_from_slice(&[0; 16]);
-        let h = unsafe { hash(padded.as_ptr(), k.len()) };
+        let h = unsafe { hash(k.as_ptr(), k.len()) };
         let mut i = h as usize & self.mask;
         loop {
             let s = self.slots[i];
@@ -1081,6 +1178,84 @@ fn read_two_col(path: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     out
 }
 
+fn selftest() {
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let seeds: [&[u8]; 10] = [
+        b"00000001791071890000",
+        b"0000000001791071890000000",
+        b"2026-10-03T23:58:10Z",
+        b"2026-10-03T19:58:10-04:00",
+        b"2028-02-29T00:00:00+05:30",
+        b"1791071890000",
+        b"0001791071890000",
+        b"86400000",
+        b"2025-12-31T23:59:59Z",
+        b"1999-01-01T00:00:00Z",
+    ];
+    let alphabet = b"0123456789-+:TZtz .e";
+    let (mut n, mut bad) = (0u64, 0u64);
+    let mut buf = vec![0u8; 64];
+    for iter in 0..40_000_000u64 {
+        let base = seeds[(iter % 10) as usize];
+        let mut f: Vec<u8> = base.to_vec();
+        let muts = next() % 7;
+        for _ in 0..muts {
+            let r = next();
+            match r % 5 {
+                0 if !f.is_empty() => {
+                    let i = (r >> 8) as usize % f.len();
+                    f[i] = alphabet[(r >> 32) as usize % alphabet.len()];
+                }
+                1 if !f.is_empty() => {
+                    let i = (r >> 8) as usize % f.len();
+                    f.remove(i);
+                }
+                2 => {
+                    let i = (r >> 8) as usize % (f.len() + 1);
+                    f.insert(i, alphabet[(r >> 32) as usize % alphabet.len()]);
+                }
+                3 if !f.is_empty() => {
+                    let i = (r >> 8) as usize % f.len();
+                    f[i] = (r >> 40) as u8;
+                }
+                _ => {
+                    let i = (r >> 8) as usize % f.len().max(1);
+                    if i < f.len() {
+                        f[i] = b'0' + ((r >> 32) % 10) as u8;
+                    }
+                }
+            }
+        }
+        if f.len() > 40 {
+            continue;
+        }
+        // field placed after 20 bytes of junk, followed by junk
+        for (i, x) in buf.iter_mut().enumerate() {
+            *x = b'a' + (i % 7) as u8;
+        }
+        buf[20..20 + f.len()].copy_from_slice(&f);
+        buf[20 + f.len()] = b',';
+        let p = unsafe { buf.as_ptr().add(20) };
+        let a = unsafe { parse_ts(p, f.len()) };
+        let b = unsafe { parse_ts_fast(p, f.len()) };
+        let c = if f.len() == 20 && f[19] == b'Z' { unsafe { (parse_dt(p), parse_dt_simd(p)) } } else { (0, 0) };
+        n += 1;
+        if a != b || c.0 != c.1 {
+            bad += 1;
+            if bad < 10 {
+                eprintln!("MISMATCH {:?}: ref {} fast {} dt {:?}", String::from_utf8_lossy(&f), a, b, c);
+            }
+        }
+    }
+    eprintln!("selftest: {} cases, {} mismatches", n, bad);
+}
+
 fn main() {
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
@@ -1093,6 +1268,10 @@ fn main() {
         )
     };
     init_daytab();
+    if std::env::var("SS_SELFTEST").is_ok() {
+        selftest();
+        return;
+    }
     let timing = std::env::var("SS_TIMING").is_ok();
     let prefault = std::env::var("SS_NOPREFAULT").is_err();
     let abl: usize = std::env::var("SS_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(99);
@@ -1315,7 +1494,7 @@ fn main() {
                             if abl == 2 { abl_sink += h; continue; }
                             let il = (en[3] - st[3]) as usize;
                             let ip = p.add(st[3] as usize);
-                            let ing = if il == 20 && *ip.add(19) == b'Z' { parse_dt(ip) } else { BAD };
+                            let ing = if il == 20 && *ip.add(19) == b'Z' { parse_dt_simd(ip) } else { BAD };
                             let ing_rel = if ing == BAD { 0xFF_FFFF } else { (ing - ing_base).clamp(0, 0xFF_FFFE) as u32 };
                             let mut rec = Rec { user: 0, pp: (line as u64) << 24, eh: h, ts: INVALID, ic: ing_rel << 8 };
                             'v: {
@@ -1323,7 +1502,7 @@ fn main() {
                                 if ulen == 0 || en[5] == st[5] {
                                     break 'v;
                                 }
-                                let t = parse_ts(p.add(st[2] as usize), (en[2] - st[2]) as usize);
+                                let t = parse_ts_fast(p.add(st[2] as usize), (en[2] - st[2]) as usize);
                                 if t < ws || t >= we {
                                     break 'v;
                                 }
@@ -1363,7 +1542,7 @@ fn main() {
                             if !ok || en[0] == st[0] || en[1] == st[1] {
                                 continue;
                             }
-                            let t = parse_ts(p.add(st[3] as usize), (en[3] - st[3]) as usize);
+                            let t = parse_ts_fast(p.add(st[3] as usize), (en[3] - st[3]) as usize);
                             if t < base_ms || t >= we {
                                 continue;
                             }
