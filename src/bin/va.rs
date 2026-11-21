@@ -588,6 +588,17 @@ unsafe fn parse_price(p: *const u8, len: usize) -> u32 {
 }
 
 // ---------------------------------------------------------------- line splitting
+#[cfg(target_feature = "avx512bw")]
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
+    let a = _mm512_loadu_si512(p as *const _);
+    (
+        _mm512_cmpeq_epi8_mask(a, _mm512_set1_epi8(b'\n' as i8)),
+        _mm512_cmpeq_epi8_mask(a, _mm512_set1_epi8(b',' as i8)),
+        _mm512_cmpeq_epi8_mask(a, _mm512_set1_epi8(b'"' as i8)),
+    )
+}
+#[cfg(not(target_feature = "avx512bw"))]
 #[inline(always)]
 unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     let a = _mm256_loadu_si256(p as *const __m256i);
@@ -1131,28 +1142,51 @@ struct LSlot {
     key: u64,
     person: u64, // person hash (in names map: name loc = pos << 24 | len)
 }
-/// 4 slots per 64-byte line: a lookup touches one cache line (overflow goes to the next bucket)
+/// 4 keys + their 4 person hashes per 64-byte line: a lookup touches one cache line. Keys that did
+/// not fit their home bucket go to the following ones, and the home bucket's overflow bit is set.
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
-struct LBucket([LSlot; 4]);
+struct LBucket {
+    keys: [u64; 4],
+    persons: [u64; 4],
+}
+const LB0: LBucket = LBucket { keys: [0; 4], persons: [0; 4] };
 struct LinkMap {
     mask: usize, // bucket mask
     slots: Vec<LBucket>,
+    ovf: Vec<u64>, // per bucket: did an insert spill past it
     names: Vec<LSlot>,
     nmask: usize,
 }
 impl LinkMap {
+    /// (person hash, linked) for user hash k; an unlinked user is its own person. Branch-free
+    /// unless k's home bucket overflowed.
     #[inline(always)]
-    unsafe fn get(&self, k: u64) -> Option<&LSlot> {
+    unsafe fn map(&self, k: u64) -> (u64, bool) {
+        let i = k as usize & self.mask;
+        let b = self.slots.get_unchecked(i);
+        let keys = _mm256_load_si256(b.keys.as_ptr() as *const __m256i);
+        let eq = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(k as i64)))) as u32;
+        let found = eq != 0;
+        let ob = (*self.ovf.get_unchecked(i >> 6) >> (i & 63)) & ((eq == 0) as u64);
+        if ob != 0 {
+            return self.map_slow(k);
+        }
+        let pers = *b.persons.get_unchecked(((eq | 16).trailing_zeros() & 3) as usize);
+        (if found { pers } else { k }, found)
+    }
+    #[cold]
+    #[inline(never)]
+    unsafe fn map_slow(&self, k: u64) -> (u64, bool) {
         let mut i = k as usize & self.mask;
         loop {
             let b = self.slots.get_unchecked(i);
-            for s in b.0.iter() {
-                if s.key == k {
-                    return Some(s);
+            for j in 0..4 {
+                if b.keys[j] == k {
+                    return (b.persons[j], true);
                 }
-                if s.key == 0 {
-                    return None;
+                if b.keys[j] == 0 {
+                    return (k, false);
                 }
             }
             i = (i + 1) & self.mask;
@@ -1190,7 +1224,7 @@ unsafe fn prefix_of(loc: u64) -> u64 {
 }
 unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
     if raw.is_empty() {
-        return LinkMap { mask: 0, slots: vec![LBucket([LSlot { key: 0, person: 0 }; 4])], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 };
+        return LinkMap { mask: 0, slots: vec![LB0], ovf: vec![0], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 };
     }
     let cap = (raw.len() * 4).next_power_of_two().max(16);
     let mask = cap - 1;
@@ -1268,7 +1302,8 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
     // final table: id hash -> person hash, 4-slot buckets, load factor <= 0.75
     let fcap = n.div_ceil(3).next_power_of_two().max(4);
     let fmask = fcap - 1;
-    let mut fin = vec![LBucket([LSlot { key: 0, person: 0 }; 4]); fcap];
+    let mut fin = vec![LB0; fcap];
+    let mut ovf = vec![0u64; fcap.div_ceil(64)];
     let mut nroots = 0usize;
     for i in 0..n {
         if parent[i] as usize == i {
@@ -1281,14 +1316,17 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
     for i in 0..n {
         let m = minid[parent[i] as usize] as usize;
         let h = hashes[i];
-        let mut j = h as usize & fmask;
+        let home = h as usize & fmask;
+        let mut j = home;
         'ins: loop {
-            for s in fin[j].0.iter_mut() {
-                if s.key == 0 {
-                    *s = LSlot { key: h, person: hashes[m] };
+            for t in 0..4 {
+                if fin[j].keys[t] == 0 {
+                    fin[j].keys[t] = h;
+                    fin[j].persons[t] = hashes[m];
                     break 'ins;
                 }
             }
+            ovf[home >> 6] |= 1 << (home & 63);
             j = (j + 1) & fmask;
         }
         if parent[i] as usize == i {
@@ -1301,7 +1339,11 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
         }
     }
     drop(slots);
-    LinkMap { mask: fmask, slots: fin, names, nmask }
+    if std::env::var_os("SS_LMSTAT").is_some() {
+        let no: u32 = ovf.iter().map(|w| w.count_ones()).sum();
+        eprintln!("linkmap: n {} buckets {} load {:.2} overflowed {}", n, fcap, n as f64 / (4 * fcap) as f64, no);
+    }
+    LinkMap { mask: fmask, slots: fin, ovf, names, nmask }
 }
 
 // ---------------------------------------------------------------- parquet
@@ -1710,8 +1752,50 @@ fn selftest() {
 }
 
 const LEAK: bool = option_env!("SS_LEAK_BUILD").is_some();
+/// TSC ticks per phase, summed over threads (SS_TIMING report):
+/// 0 dedup, 1 map+scatter (events), 2 clicks stage 2, 3 group+place, 4 click place, 5 per person
+static PHASE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+#[inline(always)]
+fn tsc() -> u64 {
+    unsafe { _rdtsc() }
+}
+
+extern "C" {
+    fn execv(path: *const i8, argv: *const *const i8) -> i32;
+}
+
+/// The image carries an x86-64-v4 (AVX-512) build next to this one; switch to it when the CPU has
+/// every v4 feature (SS_NO_V4 keeps this build).
+fn maybe_exec_v4() {
+    #[cfg(not(target_feature = "avx512bw"))]
+    {
+        if std::env::var_os("SS_NO_V4").is_some() {
+            return;
+        }
+        let ok = is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512cd")
+            && is_x86_feature_detected!("avx512dq")
+            && is_x86_feature_detected!("avx512vl");
+        if !ok {
+            return;
+        }
+        let Ok(me) = std::env::current_exe() else { return };
+        let v4 = me.with_file_name("pipeline-v4");
+        if !v4.exists() {
+            return;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(v4.as_os_str().as_bytes()).unwrap();
+        let args: Vec<std::ffi::CString> = std::env::args_os().map(|a| std::ffi::CString::new(a.as_bytes()).unwrap()).collect();
+        let mut argv: Vec<*const i8> = args.iter().map(|a| a.as_ptr()).collect();
+        argv.push(std::ptr::null());
+        unsafe { execv(path.as_ptr(), argv.as_ptr()) };
+    }
+}
 
 fn main() {
+    maybe_exec_v4();
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
     let (data_dir, out_dir) = if args.len() >= 3 {
@@ -1767,7 +1851,8 @@ fn main() {
         return;
     }
     let timing = std::env::var("SS_TIMING").is_ok();
-    let prefault = std::env::var("SS_NOPREFAULT").is_err();
+    // tmpfs page faults map 16 pages at a time (fault-around): on the scorer that beats MADV_POPULATE_READ
+    let prefault = std::env::var("SS_PREFAULT").is_ok();
     let click_dedup = std::env::var("SS_CLICK_DEDUP").is_ok();
     let strict = std::env::var("SS_STRICT").is_ok();
     let abl: usize = std::env::var("SS_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(99);
@@ -1904,7 +1989,7 @@ fn main() {
     let ck2: Vec<Sh<Vec<Vec<RecC>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let cells: Vec<Sh<Vec<Cell>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let assists: Vec<Sh<Vec<u32>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
-    let linkmap: Sh<LinkMap> = Sh::new(LinkMap { mask: 0, slots: vec![LBucket([LSlot { key: 0, person: 0 }; 4])], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 });
+    let linkmap: Sh<LinkMap> = Sh::new(LinkMap { mask: 0, slots: vec![LB0], ovf: vec![0], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 });
     let next_chunk = AtomicUsize::new(0);
     let next_p1 = AtomicUsize::new(0);
     let next_q = AtomicUsize::new(0);
@@ -1912,7 +1997,7 @@ fn main() {
     let _ = std::fs::create_dir_all(format!("{out_dir}/user_daily"));
     let _ = std::fs::create_dir_all(format!("{out_dir}/campaign_daily"));
     if timing {
-        eprintln!("setup {:?} threads={} p1={} p1c={} q={} chunks={}", t0.elapsed(), nthreads, p1, p1c, q, chunks.len());
+        eprintln!("setup {:?} v4={} threads={} p1={} p1c={} q={} chunks={}", t0.elapsed(), cfg!(target_feature = "avx512bw"), nthreads, p1, p1c, q, chunks.len());
     }
 
     std::thread::scope(|sc| {
@@ -1960,7 +2045,7 @@ fn main() {
                 *ckb = (0..p1c).map(|_| Vec::with_capacity(est_ck / (p1c * nthreads) * 17 / 16 + 64)).collect();
                 let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
                 let mut abl_sink = 0u64;
-                let mut wc1: Wc<Rec, 2> = Wc::new(p1);
+                let mut wc1: Wc<Rec, 4> = Wc::new(p1);
                 let mut wcc1: Wc<RecC, 8> = Wc::new(p1c);
                 loop {
                     let ci = next_chunk.fetch_add(1, Relaxed);
@@ -2138,6 +2223,7 @@ fn main() {
                 let mut table: Vec<u64> = Vec::new();
                 let mut table32: Vec<u32> = Vec::new();
                 let mut wc2: Wc<Rec2, 8> = Wc::new(q);
+                let mut ph = [0u64; 8];
                 let mut wcc2: Wc<RecC, 8> = Wc::new(q);
                 loop {
                     let pi = next_p1.fetch_add(1, Relaxed);
@@ -2151,6 +2237,7 @@ fn main() {
                                 (v.as_mut_ptr(), v.len())
                             })
                             .collect();
+                        let ta = tsc();
                         let n: usize = slices.iter().map(|s| s.1).sum();
                         let cap = (n * 2).next_power_of_two().max(16);
                         let mask = cap - 1;
@@ -2170,9 +2257,14 @@ fn main() {
                         };
                         let mut gi = 0usize;
                         if n < (1 << 20) - 1 {
-                            // compact table: 12-bit tag << 20 | record index + 1 (fits L2 for typical partitions)
+                            // compact table: 16-slot buckets (one 64-byte line) of 12-bit tag << 20 | record
+                            // index + 1; a lookup compares the whole bucket at once (no data-dependent branches
+                            // unless a tag matches or the bucket is full)
+                            let nb = (n / 8).next_power_of_two().max(1);
+                            let bmask = nb - 1;
                             table32.clear();
-                            table32.resize(cap, 0);
+                            table32.resize(nb * 16 + 16, 0);
+                            let tb = ((table32.as_mut_ptr() as usize + 63) & !63) as *mut u32;
                             for s in &slices {
                                 if abl == 6 {
                                     break;
@@ -2180,26 +2272,39 @@ fn main() {
                                 for i in 0..s.1 {
                                     let r = &mut *s.0.add(i);
                                     let tag = ((r.eh >> 32) & 0xFFF) as u32;
-                                    let mut idx = r.eh as usize & mask;
-                                    loop {
-                                        let e = *table32.get_unchecked(idx);
-                                        if e == 0 {
-                                            *table32.get_unchecked_mut(idx) = (tag << 20) | (gi as u32 + 1);
-                                            break;
-                                        }
-                                        if e >> 20 == tag {
+                                    let t = _mm256_set1_epi32(tag as i32);
+                                    let z = _mm256_setzero_si256();
+                                    let mut b = r.eh as usize & bmask;
+                                    'probe: loop {
+                                        let p = tb.add(b * 16);
+                                        let v0 = _mm256_load_si256(p as *const __m256i);
+                                        let v1 = _mm256_load_si256(p.add(8) as *const __m256i);
+                                        let e0 = _mm256_cmpeq_epi32(v0, z);
+                                        let e1 = _mm256_cmpeq_epi32(v1, z);
+                                        let m0 = _mm256_andnot_si256(e0, _mm256_cmpeq_epi32(_mm256_srli_epi32::<20>(v0), t));
+                                        let m1 = _mm256_andnot_si256(e1, _mm256_cmpeq_epi32(_mm256_srli_epi32::<20>(v1), t));
+                                        let mut mt = (_mm256_movemask_ps(_mm256_castsi256_ps(m0)) as u32) | ((_mm256_movemask_ps(_mm256_castsi256_ps(m1)) as u32) << 8);
+                                        let em = (_mm256_movemask_ps(_mm256_castsi256_ps(e0)) as u32) | ((_mm256_movemask_ps(_mm256_castsi256_ps(e1)) as u32) << 8);
+                                        while mt != 0 {
+                                            let j = mt.trailing_zeros() as usize;
+                                            mt &= mt - 1;
+                                            let e = *p.add(j);
                                             let o = &mut *resolve(((e & 0xF_FFFF) - 1) as usize);
                                             if o.eh == r.eh {
                                                 if (r.ic >> 8) < (o.ic >> 8) {
                                                     o.ts = DEAD;
-                                                    *table32.get_unchecked_mut(idx) = (tag << 20) | (gi as u32 + 1);
+                                                    *p.add(j) = (tag << 20) | (gi as u32 + 1);
                                                 } else {
                                                     r.ts = DEAD;
                                                 }
-                                                break;
+                                                break 'probe;
                                             }
                                         }
-                                        idx = (idx + 1) & mask;
+                                        if em != 0 {
+                                            *p.add(em.trailing_zeros() as usize) = (tag << 20) | (gi as u32 + 1);
+                                            break;
+                                        }
+                                        b = (b + 1) & bmask;
                                     }
                                     gi += 1;
                                 }
@@ -2236,6 +2341,8 @@ fn main() {
                             }
 
                         }
+                        let tb = tsc();
+                        ph[0] += tb - ta;
                         for s in &slices {
                             let recs = std::slice::from_raw_parts(s.0, s.1);
                             for i in 0..recs.len() {
@@ -2248,17 +2355,18 @@ fn main() {
                                 }
                                 let mut o = Rec2 { user: r.user, pos: (r.pp >> 24) << 1, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
                                 if has_links {
-                                    if let Some(l) = lm.get(r.user) {
-                                        o.user = l.person;
-                                        o.pos |= 1;
-                                    }
+                                    let (pu, linked) = lm.map(r.user);
+                                    o.user = pu;
+                                    o.pos |= linked as u64;
                                 }
                                 let part = (((o.user >> 32) * q as u64) >> 32) as usize;
                                 if abl == 7 { abl_sink += o.user; continue; }
                                 wc2.push(e2, part, o);
                             }
                         }
+                        ph[1] += tsc() - tb;
                     } else {
+                        let tc = tsc();
                         let pi = pi - p1;
                         let slices: Vec<(*mut RecC, usize)> = (0..nthreads)
                             .map(|t| {
@@ -2324,14 +2432,13 @@ fn main() {
                                     continue;
                                 }
                                 if has_links {
-                                    if let Some(l) = lm.get(r.user) {
-                                        r.user = l.person;
-                                    }
+                                    r.user = lm.map(r.user).0;
                                 }
                                 let part = (((r.user >> 32) * q as u64) >> 32) as usize;
                                 wcc2.push(c2, part, r);
                             }
                         }
+                        ph[2] += tsc() - tc;
                     }
                 }
                 wc2.finish(e2);
@@ -2380,6 +2487,7 @@ fn main() {
                         continue;
                     }
                     let nc: usize = (0..nthreads).map(|t| ck2[t].get()[qi].len()).sum();
+                    let t3a = tsc();
                     // group ids
                     let mut cap = (n / 4).next_power_of_two().max(1024);
                     gt.reset(cap);
@@ -2450,6 +2558,8 @@ fn main() {
                         eoff[g] = eoff[g - 1];
                     }
                     eoff[0] = 0;
+                    let t3b = tsc();
+                    ph[3] += t3b - t3a;
                     // clicks
                     coff.clear();
                     coff.resize(ng + 1, 0);
@@ -2498,6 +2608,8 @@ fn main() {
                         }
                         coff[0] = 0;
                     }
+                    let t3c = tsc();
+                    ph[4] += t3c - t3b;
                     // per person
                     for g in 0..ng {
                         let ev = &mut evs[eoff[g] as usize..eoff[g + 1] as usize];
@@ -2645,6 +2757,10 @@ fn main() {
                             active.clear();
                         }
                     }
+                    ph[5] += tsc() - t3c;
+                }
+                for (i, v) in ph.iter().enumerate() {
+                    PHASE[i].fetch_add(*v, Relaxed);
                 }
                 if timing && tid == 0 {
                     eprintln!("stage3 done {:?}", t0.elapsed());
@@ -2767,6 +2883,14 @@ fn main() {
         write_parquet(&format!("{out_dir}/user_daily/zz-leak.parquet"), k, &cols);
     }
     if timing {
+        let el = t0.elapsed().as_secs_f64();
+        let _ = el;
+        let names = ["dedup", "map", "clk2", "group", "clk3", "person"];
+        let mut line = String::from("phases(Mcyc, all threads)");
+        for (i, n) in names.iter().enumerate() {
+            line.push_str(&format!(" {}={}", n, PHASE[i].load(Relaxed) / 1_000_000));
+        }
+        eprintln!("{line}");
         let mut ru = [0i64; 18];
         unsafe { getrusage(0, &mut ru) };
         eprintln!(

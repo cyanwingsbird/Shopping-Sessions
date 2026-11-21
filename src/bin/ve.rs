@@ -793,6 +793,41 @@ unsafe fn split_gen<const NF: usize>(p: *const u8, maxlen: usize, st: &mut [u32;
     *en.get_unchecked_mut(NF - 1) = l as u32;
     (l, 1 + (qn != 0) as u32)
 }
+/// Positions (relative to p) of every newline in p[0..n) into out; returns the count. Writes two
+/// entries per 64-byte block unconditionally, so out needs room for n + 2 entries. Reads up to 63
+/// bytes past n (inputs are padded).
+#[inline(always)]
+unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
+    let nl = _mm256_set1_epi8(b'\n' as i8);
+    let mut k = 0usize;
+    let mut i = 0usize;
+    while i < n {
+        let a = _mm256_loadu_si256(p.add(i) as *const __m256i);
+        let b = _mm256_loadu_si256(p.add(i + 32) as *const __m256i);
+        let mut m = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, nl)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, nl)) as u32 as u64) << 32);
+        m = _bzhi_u64(m, (n - i).min(64) as u32);
+        let c = m.count_ones() as usize;
+        let o = out.add(k);
+        *o = i as u32 + m.trailing_zeros();
+        let m2 = m & m.wrapping_sub(1);
+        *o.add(1) = i as u32 + m2.trailing_zeros();
+        if c > 2 {
+            let mut mm = m2 & m2.wrapping_sub(1);
+            let mut j = 2;
+            while mm != 0 {
+                *o.add(j) = i as u32 + mm.trailing_zeros();
+                mm &= mm - 1;
+                j += 1;
+            }
+        }
+        k += c;
+        i += 64;
+    }
+    k
+}
+const SCAN: usize = 1 << 14;
+
 #[derive(Default, Clone, Copy)]
 struct Sp7 {
     kind: u32, // 0 ok, 1 malformed, 2 needs the general splitter
@@ -1852,7 +1887,7 @@ fn main() {
     }
     let timing = std::env::var("SS_TIMING").is_ok();
     // tmpfs page faults map 16 pages at a time (fault-around): on the scorer that beats MADV_POPULATE_READ
-    let prefault = std::env::var("SS_NOPREFAULT").is_err();
+    let prefault = std::env::var("SS_PREFAULT").is_ok();
     let click_dedup = std::env::var("SS_CLICK_DEDUP").is_ok();
     let strict = std::env::var("SS_STRICT").is_ok();
     let abl: usize = std::env::var("SS_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(99);
@@ -2045,7 +2080,8 @@ fn main() {
                 *ckb = (0..p1c).map(|_| Vec::with_capacity(est_ck / (p1c * nthreads) * 17 / 16 + 64)).collect();
                 let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
                 let mut abl_sink = 0u64;
-                let mut wc1: Wc<Rec, 2> = Wc::new(p1);
+                let mut wc1: Wc<Rec, 4> = Wc::new(p1);
+                let mut nlbuf: Vec<u32> = vec![0u32; SCAN + 64];
                 let mut wcc1: Wc<RecC, 8> = Wc::new(p1c);
                 loop {
                     let ci = next_chunk.fetch_add(1, Relaxed);
@@ -2129,17 +2165,36 @@ fn main() {
                             wc1.push(evb, part, rec);
                             };
                         }
-                        while s < c.b {
-                            let p = base().add(s);
-                            let sp = if strict { Sp7 { kind: 2, ..Default::default() } } else { split_ev7f(p, c.fe - s) };
+                        'blocks: while s < c.b {
+                        // line ends of the next SCAN bytes first, so that each line's parse does not wait
+                        // on the previous line's newline search
+                        let scan_end = (s + SCAN).min(c.fe);
+                        let mut k = scan_nl(base().add(s), scan_end - s, nlbuf.as_mut_ptr());
+                        let s0 = s;
+                        if k == 0 {
+                            let mut e = scan_end;
+                            while e < c.fe && *base().add(e) != b'\n' {
+                                e += 1;
+                            }
+                            *nlbuf.get_unchecked_mut(0) = (e - s0) as u32;
+                            k = 1;
+                        }
+                        for j in 0..k {
+                            if s >= c.b {
+                                break 'blocks;
+                            }
+                            let line_at = s;
+                            s = s0 + *nlbuf.get_unchecked(j) as usize + 1;
+                            let p = base().add(line_at);
+                            let sp = if strict { Sp7 { kind: 2, ..Default::default() } } else { split_ev7f(p, c.fe - line_at) };
                             if sp.kind >= 1 {
                                 // malformed, or a shape the fast splitter does not take: general path
-                                let (len, ok) = if strict {
-                                    splitn::<7>(p, c.fe - s, &mut st, &mut en)
+                                let (_len, ok) = if strict {
+                                    splitn::<7>(p, c.fe - line_at, &mut st, &mut en)
                                 } else if sp.kind == 1 {
                                     (sp.len as usize, false)
                                 } else {
-                                    let (l, r) = split_gen_full::<7>(p, c.fe - s, &mut st, &mut en);
+                                    let (l, r) = split_gen_full::<7>(p, c.fe - line_at, &mut st, &mut en);
                                     if r == 2 {
                                         for k in 0..7 {
                                             let (a, b) = (st[k], en[k]);
@@ -2150,34 +2205,44 @@ fn main() {
                                     }
                                     (l, r != 0)
                                 };
-                                let line = s;
-                                s += len + 1;
                                 if !ok {
                                     continue;
                                 }
                                 let fld = |k: usize| -> (usize, usize) { (st[k] as usize, (en[k] - st[k]) as usize) };
-                                ev_body!(p, line, fld);
+                                ev_body!(p, line_at, fld);
                                 continue;
                             }
-                            let line = s;
-                            s += sp.len as usize + 1;
                             let fld = |k: usize| -> (usize, usize) { sp.field(k) };
-                            ev_body!(p, line, fld);
+                            ev_body!(p, line_at, fld);
+                        }
                         }
                     } else {
-                        while s < c.b {
-                            let p = base().add(s);
-                            let sp = if strict { Sp4 { kind: 2, ..Default::default() } } else { split_ck4f(p, c.fe - s) };
+                        'cblocks: while s < c.b {
+                        let scan_end = (s + SCAN).min(c.fe);
+                        let mut k = scan_nl(base().add(s), scan_end - s, nlbuf.as_mut_ptr());
+                        let s0 = s;
+                        if k == 0 {
+                            let mut e = scan_end;
+                            while e < c.fe && *base().add(e) != b'\n' {
+                                e += 1;
+                            }
+                            *nlbuf.get_unchecked_mut(0) = (e - s0) as u32;
+                            k = 1;
+                        }
+                        for j in 0..k {
+                            if s >= c.b {
+                                break 'cblocks;
+                            }
                             let line = s;
+                            s = s0 + *nlbuf.get_unchecked(j) as usize + 1;
+                            let p = base().add(line);
+                            let sp = if strict { Sp4 { kind: 2, ..Default::default() } } else { split_ck4f(p, c.fe - line) };
                             let (r, fs) = if sp.kind == 0 {
-                                s += sp.len as usize + 1;
                                 (1u32, [sp.field(0), sp.field(1), sp.field(2), sp.field(3)])
                             } else if sp.kind == 1 {
-                                s += sp.len as usize + 1;
                                 continue;
                             } else {
-                                let (len, r) = split_ev::<4>(strict, p, c.fe - s, &mut st, &mut en);
-                                s += len + 1;
+                                let (_len, r) = split_ev::<4>(strict, p, c.fe - line, &mut st, &mut en);
                                 let qd = r == 2;
                                 (r, [fldq(p, &st, &en, 0, qd), fldq(p, &st, &en, 1, qd), fldq(p, &st, &en, 2, qd), fldq(p, &st, &en, 3, qd)])
                             };
@@ -2205,6 +2270,7 @@ fn main() {
                                 kh: h as u32,
                             });
                         }
+                        }
                     }
                 }
                 wc1.finish(evb);
@@ -2222,7 +2288,7 @@ fn main() {
                 *c2 = (0..q).map(|_| Vec::with_capacity(est_ck / (q * nthreads) * 5 / 4 + 64)).collect();
                 let mut table: Vec<u64> = Vec::new();
                 let mut table32: Vec<u32> = Vec::new();
-                let mut wc2: Wc<Rec2, 8> = Wc::new(q);
+                let mut wc2: Wc<Rec2, 4> = Wc::new(q);
                 let mut ph = [0u64; 8];
                 let mut wcc2: Wc<RecC, 8> = Wc::new(q);
                 loop {

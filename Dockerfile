@@ -1,12 +1,15 @@
-# Shopping Sessions: single static-ish Rust binary, no runtime engine to start.
 FROM rust:1.91-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml ./
 COPY .cargo .cargo
 COPY src src
-RUN cargo build --release --bin pipeline && strip target/release/pipeline
+RUN cargo build --release && cd target/release && strip va vb vc vd ve
+COPY bench/generator /gen
+RUN cd /gen && cargo build --release && strip target/release/generate
 
 FROM debian:bookworm-slim
-COPY --from=build /src/target/release/pipeline /app/pipeline
+COPY --from=build /src/target/release/va /src/target/release/vb /src/target/release/vc /src/target/release/vd /src/target/release/ve /app/
+COPY --from=build /gen/target/release/generate /app/generate
+COPY bench/ab.sh /app/ab.sh
 USER 1000:1000
-CMD ["/app/pipeline"]
+CMD ["/bin/sh", "/app/ab.sh"]
