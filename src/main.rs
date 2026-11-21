@@ -160,8 +160,8 @@ struct Rec {
 struct RecC {
     user: u64,
     pc: u64, // line pos << 16 | campaign
-    kh: u64,
     ts: u32,
+    kh: u32, // low bits of the click_id hash (only used by the optional click dedup)
 }
 /// Event record after dedup, grouped by person: 24 bytes.
 #[repr(C)]
@@ -1192,8 +1192,6 @@ struct Cell {
     revenue: u64,
     sessions: u32,
     purch: u32,
-    assisted: u32,
-    _p: u32,
 }
 struct GTable {
     keys: Vec<u64>,
@@ -1581,6 +1579,7 @@ fn main() {
     let ev2: Vec<Sh<Vec<Vec<Rec2>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let ck2: Vec<Sh<Vec<Vec<RecC>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let cells: Vec<Sh<Vec<Cell>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
+    let assists: Vec<Sh<Vec<u32>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let linkmap: Sh<LinkMap> = Sh::new(LinkMap { mask: 0, slots: vec![LSlot { key: 0, person: 0 }], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 });
     let next_chunk = AtomicUsize::new(0);
     let next_p1 = AtomicUsize::new(0);
@@ -1594,7 +1593,7 @@ fn main() {
 
     std::thread::scope(|sc| {
         for tid in 0..nthreads {
-            let (chunks, ev1, ck1, ev2, ck2, cells, linkmap) = (&chunks, &ev1, &ck1, &ev2, &ck2, &cells, &linkmap);
+            let (chunks, ev1, ck1, ev2, ck2, cells, linkmap, assists) = (&chunks, &ev1, &ck1, &ev2, &ck2, &cells, &linkmap, &assists);
             let (next_chunk, next_p1, next_q, barrier) = (&next_chunk, &next_p1, &next_q, &barrier);
             let (prod_tab, camp_tab, ln_segs, cat_names, cat_rank, out_dir) = (&prod_tab, &camp_tab, &ln_segs, &cat_names, &cat_rank, &out_dir);
             let body = move || unsafe {
@@ -1632,8 +1631,8 @@ fn main() {
                 // ================= stage 1: parse
                 let evb = ev1[tid].get();
                 let ckb = ck1[tid].get();
-                *evb = (0..p1).map(|_| Vec::with_capacity(est_ev / (p1 * nthreads) * 5 / 4 + 64)).collect();
-                *ckb = (0..p1c).map(|_| Vec::with_capacity(est_ck / (p1c * nthreads) * 5 / 4 + 64)).collect();
+                *evb = (0..p1).map(|_| Vec::with_capacity(est_ev / (p1 * nthreads) * 17 / 16 + 64)).collect();
+                *ckb = (0..p1c).map(|_| Vec::with_capacity(est_ck / (p1c * nthreads) * 17 / 16 + 64)).collect();
                 let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
                 let mut abl_sink = 0u64;
                 loop {
@@ -1743,7 +1742,7 @@ fn main() {
                                 user: hash(p.add(f1), l1),
                                 pc: ((line as u64) << 16) | camp as u64,
                                 ts: (t - base_ms) as u32,
-                                kh: h,
+                                kh: h as u32,
                             });
                         }
                     }
@@ -1872,7 +1871,7 @@ fn main() {
                             }
                             for i in 0..s.1 {
                                 let r = &mut *s.0.add(i);
-                                let kh = r.kh & 0xFFFF_FFFF;
+                                let kh = r.kh as u64;
                                 let mut idx = kh as usize & mask;
                                 loop {
                                     let e = *table.get_unchecked(idx);
@@ -1882,7 +1881,9 @@ fn main() {
                                     }
                                     if e >> 32 == kh {
                                         let o = &*resolve((e as u32 - 1) as usize);
-                                        if o.kh == r.kh {
+                                        let (ap, al) = field_at(r.pc >> 16, 0);
+                                        let (bp, bl) = field_at(o.pc >> 16, 0);
+                                        if sl(ap, al) == sl(bp, bl) {
                                             r.ts = DEAD;
                                             break;
                                         }
@@ -1920,6 +1921,8 @@ fn main() {
                 // ================= stage 3: per person
                 let cell = cells[tid].get();
                 *cell = vec![Cell::default(); (ncamp + 1) * nd];
+                let asst_cells = assists[tid].get();
+                *asst_cells = vec![0u32; (ncamp + 1) * nd];
                 let mut out = UOut::default();
                 let mut gt = GTable { keys: Vec::new(), vals: Vec::new(), mask: 0 };
                 let mut gids: Vec<u32> = Vec::new();
@@ -2204,7 +2207,7 @@ fn main() {
                                     camp = ck.get_unchecked(hi - 1).1 as usize;
                                 }
                                 for &a in &active {
-                                    cell.get_unchecked_mut(a as usize * nd + day as usize).assisted += 1;
+                                    *asst_cells.get_unchecked_mut(a as usize * nd + day as usize) += 1;
                                 }
                             }
                             let ce = cell.get_unchecked_mut(camp * nd + day as usize);
@@ -2262,13 +2265,19 @@ fn main() {
     }
     // ---- campaign_daily
     let mut tot = vec![Cell::default(); (ncamp + 1) * nd];
+    let mut tot_asst = vec![0u32; (ncamp + 1) * nd];
+    for a in &assists {
+        let a = unsafe { a.get() };
+        for (t, x) in tot_asst.iter_mut().zip(a.iter()) {
+            *t += *x;
+        }
+    }
     for c in &cells {
         let c = unsafe { c.get() };
         for (a, b) in tot.iter_mut().zip(c.iter()) {
             a.revenue += b.revenue;
             a.sessions += b.sessions;
             a.purch += b.purch;
-            a.assisted += b.assisted;
         }
     }
     let (mut ids, mut chans) = (Vec::new(), Vec::new());
@@ -2278,7 +2287,8 @@ fn main() {
         let (id, ch): (&[u8], &[u8]) = if c == ncamp { (b"organic", b"organic") } else { (camps.a(c), camps.b(c)) };
         for d in 0..nd {
             let x = tot[c * nd + d];
-            if x.sessions == 0 && x.assisted == 0 {
+            let xa = tot_asst[c * nd + d];
+            if x.sessions == 0 && xa == 0 {
                 continue;
             }
             ids.extend_from_slice(&(id.len() as u32).to_le_bytes());
@@ -2289,7 +2299,7 @@ fn main() {
             sess.push(x.sessions as i32);
             purch.push(x.purch as i32);
             revs.push(x.revenue as i64);
-            asst.push(x.assisted as i32);
+            asst.push(xa as i32);
         }
     }
     let cols = [
