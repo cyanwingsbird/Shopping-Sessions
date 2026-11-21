@@ -2647,7 +2647,7 @@ fn main() {
                 let mut gids: Vec<u32> = Vec::new();
                 let mut rtmp: Vec<u64> = Vec::new();
                 let mut rv2: Vec<u64> = Vec::new();
-                let mut elen: Vec<u32> = Vec::new();
+                let mut tlist: Vec<(u32, u64)> = Vec::new();
                 let mut rg2: Vec<u32> = Vec::new();
                 let mut vals: Vec<u64> = Vec::new();
                 let mut cgids: Vec<u32> = Vec::new();
@@ -2787,9 +2787,8 @@ fn main() {
                         eoff[g] = eoff[g - 1];
                     }
                     eoff[0] = 0;
-                    // tombstones: drop one event with the same (ts, price, category) from the person
-                    elen.clear();
-                    elen.extend((0..ng).map(|g| eoff[g + 1] - eoff[g]));
+                    // tombstones: (person, ts << 32 | pc) sorted, applied per person after its events are sorted
+                    tlist.clear();
                     for t in 0..nthreads {
                         for tr in tomb[t].get()[qi].iter() {
                             let k = tr.user;
@@ -2802,14 +2801,11 @@ fn main() {
                                 assert!(kk != 0, "tombstone without its event");
                                 idx = (idx + 1) & gt.mask;
                             };
-                            let v = ((tr.ts as u64) << 32) | tr.pc as u64;
-                            let a = eoff[g] as usize;
-                            let e = a + elen[g] as usize;
-                            let j = (a..e).find(|&j| evs[j] == v).expect("tombstone without its event");
-                            evs.copy_within(j + 1..e, j);
-                            elen[g] -= 1;
+                            tlist.push((g as u32, ((tr.ts as u64) << 32) | tr.pc as u64));
                         }
                     }
+                    tlist.sort_unstable();
+                    let mut tp = 0usize;
                     let t3b = tsc();
                     ph[3] += t3b - t3a;
                     // clicks
@@ -2881,11 +2877,8 @@ fn main() {
                                 _mm_prefetch(base().add((loc >> 24) as usize) as *const i8, _MM_HINT_T0);
                             }
                         }
-                        if elen[g] == 0 {
-                            continue;
-                        }
                         let tf0 = if PHASE_FINE { tsc() } else { 0 };
-                        let ev = &mut evs[eoff[g] as usize..(eoff[g] + elen[g]) as usize];
+                        let mut ev = &mut evs[eoff[g] as usize..eoff[g + 1] as usize];
                         if RADIX3 {
                         } else if ev.len() > 1024 {
                             // big persons (whales, shared devices): stable LSD radix sort on ts
@@ -2893,6 +2886,35 @@ fn main() {
                             radix_ts(ev, &mut rtmp);
                         } else if ev.len() > 1 {
                             ev.sort_unstable();
+                        }
+                        if tp < tlist.len() && tlist[tp].0 == g as u32 {
+                            // drop one event equal to each tombstone (bit 63 marks a dropped one), then compact
+                            let key = |x: u64| (x >> 32) & 0x7FFF_FFFF;
+                            while tp < tlist.len() && tlist[tp].0 == g as u32 {
+                                let v = tlist[tp].1;
+                                tp += 1;
+                                let t = v >> 32;
+                                let mut j = ev.partition_point(|&x| key(x) < t);
+                                while j < ev.len() && key(ev[j]) == t {
+                                    if ev[j] == v {
+                                        ev[j] |= 1 << 63;
+                                        break;
+                                    }
+                                    j += 1;
+                                }
+                            }
+                            let mut w = 0;
+                            for r in 0..ev.len() {
+                                let x = ev[r];
+                                if x >> 63 == 0 {
+                                    ev[w] = x;
+                                    w += 1;
+                                }
+                            }
+                            ev = &mut ev[..w];
+                            if w == 0 {
+                                continue;
+                            }
                         }
                         let ck = &mut cks[coff[g] as usize..coff[g + 1] as usize];
                         if ck.len() > 1 {
