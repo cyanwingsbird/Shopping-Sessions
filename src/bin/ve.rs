@@ -832,8 +832,14 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     k
 }
 const SCAN: usize = 1 << 16;
+/// bit filter in front of the link table
+const LFILT: bool = true;
+/// records per partition staged before a streaming write in stage 2 (24-byte records: 4 or 8)
+const WC2K: usize = 4;
+/// event lines: prefetch this many bytes ahead (0 = rely on the hardware prefetcher)
+const PFD: usize = 0;
 /// all threads parse the link files before thread 0 builds the map
-const PLINKS: bool = false;
+const PLINKS: bool = true;
 /// ids of up to 16 bytes hashed with a single multiply
 const HASH1: bool = true;
 /// find line ends with a separate pass over each 64 KB block (else: from the splitter, line by line)
@@ -1225,7 +1231,7 @@ impl LinkMap {
     #[inline(always)]
     unsafe fn bucket_ptr(&self, k: u64) -> (*const LBucket, u64, usize) {
         let fi = (k >> 32) as usize & self.fmask;
-        let bit = (*self.filt.get_unchecked(fi >> 6) >> (fi & 63)) & 1;
+        let bit = if LFILT { (*self.filt.get_unchecked(fi >> 6) >> (fi & 63)) & 1 } else { 1 };
         let i = self.bucket(k);
         let p = if bit != 0 { self.slots.as_ptr().add(i) } else { &self.empty as *const LBucket };
         (p, bit, i)
@@ -2374,6 +2380,9 @@ fn main() {
                             while s < c.b {
                                 let line_at = s;
                                 let p = base().add(line_at);
+                                if PFD > 0 {
+                                    _mm_prefetch(p.add(PFD) as *const i8, _MM_HINT_T0);
+                                }
                                 let sp = if strict { Sp7 { kind: 2, ..Default::default() } } else { split_ev7f(p, c.fe - line_at) };
                                 if sp.kind == 0 {
                                     s = line_at + sp.len as usize + 1;
@@ -2562,7 +2571,7 @@ fn main() {
                 *e2 = (0..q).map(|_| Vec::with_capacity(est_ev / (q * nthreads) * 5 / 4 + 64)).collect();
                 let mut table: Vec<u64> = Vec::new();
                 let mut table32: Vec<u32> = Vec::new();
-                let mut wc2: Wc<Rec2, 8> = Wc::new(q);
+                let mut wc2: Wc<Rec2, WC2K> = Wc::new(q);
                 let mut ph = [0u64; 8];
                 loop {
                     let pi = next_p1.fetch_add(1, Relaxed);
