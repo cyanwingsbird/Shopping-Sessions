@@ -941,7 +941,7 @@ const EVFN: bool = true;
 /// stage-2 dedup: bitmap prefilter, exact table only for possible copies
 const DEDUPBM: bool = false;
 /// stage 3: partitions of at least SUB3MIN events are split into SUB3 pieces by person hash
-const SUB3: usize = 4;
+const SUB3: usize = 2;
 const SUB3MIN: usize = 32768;
 /// stage-2 scatter: staging-slot prefetch distance (0 = none)
 const PFW: usize = 0;
@@ -958,7 +958,7 @@ const CRING: usize = 8;
 /// SS_ABL ablations (diagnostic builds only)
 const DIAG: bool = false;
 /// records per partition staged before a streaming write in stage 1 (32-byte records)
-const WC1K: usize = 8;
+const WC1K: usize = 4;
 /// stage-2 output blocks recycled from consumed stage-1 memory
 const RECYCLE: bool = true;
 /// stage 3 ts radix: 3 passes of 11 bits (else 4 of 8)

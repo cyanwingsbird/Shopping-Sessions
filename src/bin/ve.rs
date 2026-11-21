@@ -952,7 +952,7 @@ const PFD2: usize = 8;
 /// pin each thread to one of the allowed CPUs
 const PIN: bool = true;
 /// stage 2: link-table prefetch distance (records)
-const PF2: usize = 48;
+const PF2: usize = 24;
 /// clicks are mapped to persons this many clicks after their link-table line was prefetched
 const CRING: usize = 8;
 /// SS_ABL ablations (diagnostic builds only)
@@ -960,7 +960,7 @@ const DIAG: bool = false;
 /// records per partition staged before a streaming write in stage 1 (32-byte records)
 const WC1K: usize = 4;
 /// stage-2 output blocks recycled from consumed stage-1 memory
-const RECYCLE: bool = true;
+const RECYCLE: bool = false;
 /// stage 3 ts radix: 3 passes of 11 bits (else 4 of 8)
 const R11: bool = false;
 /// assists counted per activation interval of a campaign instead of per session

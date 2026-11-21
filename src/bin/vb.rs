@@ -937,11 +937,11 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
 }
 const SCAN: usize = 1 << 16;
 /// stage-1 event lines in a function of their own
-const EVFN: bool = false;
+const EVFN: bool = true;
 /// stage-2 dedup: bitmap prefilter, exact table only for possible copies
 const DEDUPBM: bool = false;
 /// stage 3: partitions of at least SUB3MIN events are split into SUB3 pieces by person hash
-const SUB3: usize = 4;
+const SUB3: usize = 1;
 const SUB3MIN: usize = 32768;
 /// stage-2 scatter: staging-slot prefetch distance (0 = none)
 const PFW: usize = 0;
