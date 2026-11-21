@@ -1226,12 +1226,13 @@ impl LinkMap {
         let keys = _mm256_load_si256(b.keys.as_ptr() as *const __m256i);
         let eq = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(k as i64)))) as u32;
         let found = eq != 0;
-        let ob = (*self.ovf.get_unchecked(i >> 6) >> (i & 63)) & ((eq == 0) as u64) & bit;
+        let ob = (*self.ovf.get_unchecked(i >> 6) >> (i & 63)) & (std::hint::select_unpredictable(eq == 0, 1u64, 0u64)) & bit;
         if ob != 0 {
             return self.map_slow(k);
         }
         let pers = *b.persons.get_unchecked(((eq | 16).trailing_zeros() & 3) as usize);
-        (if found { pers } else { k }, found)
+        // select without a branch: whether a user is linked is unpredictable
+        (std::hint::select_unpredictable(found, pers, k), found)
     }
     #[cold]
     #[inline(never)]
@@ -2003,6 +2004,7 @@ fn main() {
     let abl: usize = std::env::var("SS_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(99);
     let envn = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
     let repeat = envn("SS_REPEAT").unwrap_or(1);
+    let stop = envn("SS_STOP").unwrap_or(9);
     let nthreads = envn("SS_THREADS")
         .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
         .or(envn("NCPU"))
@@ -2279,7 +2281,9 @@ fn main() {
                                 let tp = $p.add(f4);
                                 if tl == 4 {
                                     let w = rd32(tp);
-                                    if w != u32::from_le_bytes(*b"view") && w != u32::from_le_bytes(*b"cart") {
+                                    let (a, b) = (w ^ u32::from_le_bytes(*b"view"), w ^ u32::from_le_bytes(*b"cart"));
+                                    // both nonzero <=> bad type; one test, no branch on which of the two it is
+                                    if ((a | a.wrapping_neg()) & (b | b.wrapping_neg())) >> 31 != 0 {
                                         break 'v;
                                     }
                                 } else if tl == 8 && rd64(tp) == u64::from_le_bytes(*b"purchase") {
@@ -2393,6 +2397,13 @@ fn main() {
                             if r == 0 || l0 == 0 || l1 == 0 {
                                 continue;
                             }
+                            // user first: its link-table line is fetched while ts and campaign are parsed
+                            let uh = hash(p.add(f1), l1);
+                            if ck_direct {
+                                if let Some(l) = lm1 {
+                                    l.prefetch(uh);
+                                }
+                            }
                             let t = parse_ts_fast(p.add(f3), l3);
                             if t < base_ms || t >= we {
                                 continue;
@@ -2401,7 +2412,6 @@ fn main() {
                                 Some(c) => c,
                                 None => continue,
                             };
-                            let uh = hash(p.add(f1), l1);
                             if ck_direct {
                                 let lmr = match lm1 {
                                     Some(l) => l,
@@ -2442,6 +2452,9 @@ fn main() {
                 barrier.wait();
                 if timing && tid == 0 {
                     eprintln!("stage1 done {:?} {}", t0.elapsed(), abl_sink);
+                }
+                if stop == 1 {
+                    _exit(0);
                 }
                 // ================= stage 2: dedup, translate to person, scatter
                 let lm: &LinkMap = linkmap.get();
@@ -2676,6 +2689,9 @@ fn main() {
                 barrier.wait();
                 if timing && tid == 0 {
                     eprintln!("stage2 done {:?} {}", t0.elapsed(), abl_sink);
+                }
+                if stop == 2 {
+                    _exit(0);
                 }
                 // ================= stage 3: per person
                 let cell = cells[tid].get();
