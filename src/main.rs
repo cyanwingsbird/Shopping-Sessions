@@ -1008,6 +1008,8 @@ const RELEASE: bool = true;
 const NAMECP: bool = true;
 /// stage 1: ISO ts with an offset parsed with ingest_ts in the same SIMD pass as the Z form
 const ISOM: bool = true;
+/// input page tables dropped in 32 MB pieces by threads done writing, once stage 3 is over everywhere
+const RELEASE2: bool = true;
 /// stage-3 assists: day block of each session kept, pdays ends with a sentinel
 const ASBLK: bool = true;
 /// link build: all ids first, then the unions with the parent entries prefetched
@@ -1017,7 +1019,7 @@ const WILLNEED: bool = false;
 /// stage-3 person table: initial capacity n / GTDIV slots (grows when half full)
 const GTDIV: usize = 4;
 /// stage-3 ts radix on (ts, index) keys only; gid and price fetched by index when placing
-const RADIXK: bool = false;
+const RADIXK: bool = true;
 /// stage-2 dedup table: one 16-slot bucket per DDIV records (rounded up to a power of two)
 const DDIV: usize = 8;
 /// stage 1: user hash and type check before the timestamps (shorter live ranges)
@@ -3721,6 +3723,8 @@ fn main() {
     let links_ready = std::sync::atomic::AtomicBool::new(false);
     let next_p1 = AtomicUsize::new(0);
     let next_q = AtomicUsize::new(0);
+    let s3_done = AtomicUsize::new(0);
+    let rel_next = AtomicUsize::new(0);
     let barrier = Barrier::new(nthreads);
     let cpus: Vec<usize> = {
         let mut m = [0u64; 16];
@@ -3756,6 +3760,7 @@ fn main() {
         for tid in 0..nthreads {
             let (chunks, ev1, ck1, ev2, ck2, cells, linkmap, assists) = (&chunks, &ev1, &ck1, &ev2, &ck2, &cells, &linkmap, &assists);
             let (next_chunk, next_p1, next_q, barrier) = (&next_chunk, &next_p1, &next_q, &barrier);
+            let (s3_done, rel_next) = (&s3_done, &rel_next);
             let links_ready = &links_ready;
             let (lchunks, next_lchunk, lraw) = (&lchunks, &next_lchunk, &lraw);
             let (camp_tab, camp_short, ln_segs, out_dir) = (&camp_tab, &camp_short, &ln_segs, &out_dir);
@@ -5202,6 +5207,9 @@ fn main() {
                     }
                 }
                 perf.stage(2);
+                if RELEASE2 {
+                    s3_done.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
                 for (i, v) in ph.iter().enumerate() {
                     PHASE[i].fetch_add(*v, Relaxed);
                 }
@@ -5237,7 +5245,23 @@ fn main() {
                     }
                 }
                 std::mem::forget(out);
-                if RELEASE {
+                if RELEASE2 {
+                    // drop the input's page-table entries in parallel (left to exit, one thread unmaps them
+                    // all) once every thread is past stage 3; threads that are done writing take 32 MB
+                    // pieces while the last ones still write
+                    while s3_done.load(std::sync::atomic::Ordering::Acquire) < nthreads {
+                        std::hint::spin_loop();
+                    }
+                    const PIECE: usize = 32 << 20;
+                    loop {
+                        let k = rel_next.fetch_add(1, Relaxed);
+                        let a = k * PIECE;
+                        if a >= total {
+                            break;
+                        }
+                        madvise(base().add(a) as *mut u8, PIECE.min(total - a), 4);
+                    }
+                } else if RELEASE {
                     // drop the input's page-table entries in parallel: left to exit, one thread unmaps them all
                     barrier.wait();
                     let step = (total / nthreads + (2 << 20)) & !((2usize << 20) - 1);
