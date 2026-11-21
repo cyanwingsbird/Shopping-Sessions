@@ -5473,5 +5473,12 @@ fn main() {
             ru[4] / 1024
         );
     }
+    #[cfg(pgo_gen)]
+    unsafe {
+        extern "C" {
+            fn __llvm_profile_write_file() -> i32;
+        }
+        __llvm_profile_write_file();
+    }
     unsafe { _exit(0) }
 }
