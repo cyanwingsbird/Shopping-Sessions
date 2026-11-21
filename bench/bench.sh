@@ -27,35 +27,23 @@ run() {
 }
 /app/micro "$S/gen" > "$S/micro.txt" 2>&1
 cat "$S/micro.txt" >&2
-run def1
-run def2
-run t1 SS_THREADS=1
-run t4 SS_THREADS=4
-run abl1_split SS_ABL=1
-run abl3_nopush SS_ABL=3
-run abl7_noscatter2 SS_ABL=7
-run def3
-# correct tables for /data, plus 5 extra user_daily rows (user_id starts with "!") carrying numbers:
-#   day = wall ms (as days since 1970), sessions = stage1 ms, events = stage2 ms,
-#   revenue_cents = stage3_ms * 1e10 + user_ms * 1e5 + sys_ms, top_category = short note
+run v4a
+run v3a SS_NO_V4=1
+run v4b
+run v3b SS_NO_V4=1
+run v4t1 SS_THREADS=1
+run v3t1 SS_THREADS=1 SS_NO_V4=1
+run v4c
+run v3c SS_NO_V4=1
+# correct tables for /data, plus 5 extra user_daily rows (user_id starts with "!") carrying text
 /app/pipeline /data /output
-NP=$(nproc); THP=$(sed 's/.*\[\(.*\)\].*/\1/' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | cut -c1-2)
-awk -v np="$NP" -v thp="$THP" '
-  function num(x) { gsub(/[^0-9.]/, "", x); return x + 0 }
-  { name = $1; w[name] = $2
-    for (i = 3; i <= NF; i++) {
-      if ($i ~ /^s1:/) s1[name] = substr($i, 4) + 0; else if ($i ~ /^s2:/) s2[name] = substr($i, 4) + 0; else if ($i ~ /^s3:/) s3[name] = substr($i, 4) + 0
-      else if ($i ~ /^li/) li[name] = num($i); else if ($i ~ /^tot/) to[name] = num($i)
-      else if ($i ~ /^u[0-9]/) us[name] = num($i) * 1000; else if ($i ~ /^s[0-9]/) sy[name] = num($i) * 1000 } }
-  function row(id, n, note) { printf "%s\t%d\t%d\t%d\t%.0f\t%s\n", id, w[n], s1[n], s2[n], s3[n] * 1e10 + us[n] * 1e5 + sy[n], note }
-  END {
-    row("!1def1", "def1", "n" np " thp" thp " li" li["def1"])
-    row("!2def2", "def2", "li" li["def2"] " tot" to["def2"])
-    row("!3t1", "t1", "li" li["t1"] " tot" to["t1"])
-    row("!4t4", "t4", "a1w" w["abl1_split"] " a3w" w["abl3_nopush"] " a7w" w["abl7_noscatter2"] " d3w" w["def3"])
-  }' "$S/runs.txt" > "$S/rows.txt"
-awk '/^model/ { sub(/^model /, ""); m = $0 } /^info/ { i = $0 } /^flags/ { f = $0 } /^mount/ { mo = mo " " $2 } /^res/ { r = $0 }
-  END { printf "!6 %s\t0\t0\t0\t0\t%s\n", m, f; printf "!7 %s\t0\t0\t0\t0\t%s\n", i, mo; printf "!8\t0\t0\t0\t0\t%s\n", r }' "$S/micro.txt" >> "$S/rows.txt"
+{
+  printf '!0a %s\t0\t0\t0\t0\t%s\n' "$(grep '^info' "$S/micro.txt" | cut -c6-) $(grep '^mount' "$S/micro.txt" | tr '\n' ' ')" "$(grep '^res' "$S/micro.txt" | cut -c5-)"
+  printf '!1 %s\t0\t0\t0\t0\t%s\n' "$(grep '^v4a ' "$S/runs.txt")" "$(grep '^v3a ' "$S/runs.txt")"
+  printf '!2 %s\t0\t0\t0\t0\t%s\n' "$(grep '^v4b ' "$S/runs.txt")" "$(grep '^v3b ' "$S/runs.txt")"
+  printf '!3 %s\t0\t0\t0\t0\t%s\n' "$(grep '^v4c ' "$S/runs.txt")" "$(grep '^v3c ' "$S/runs.txt")"
+  printf '!4 %s\t0\t0\t0\t0\t%s\n' "$(grep '^v4t1 ' "$S/runs.txt")" "$(grep '^v3t1 ' "$S/runs.txt")"
+} > "$S/rows.txt"
 cat "$S/rows.txt" >&2
 SS_EMIT_TEXT="$S/rows.txt" /app/pipeline x /output/user_daily/zz-report.parquet
 exit 0

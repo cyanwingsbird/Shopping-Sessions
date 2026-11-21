@@ -383,6 +383,56 @@ unsafe fn parse_dt_simd(p: *const u8) -> i64 {
     };
     days * 86400 + (h * 3600 + mi * 60 + s) as i64
 }
+/// A 20-byte F1 ts (validated; caller checked p[19] == 'Z') and ingest_ts (trusted) in one AVX2 pass:
+/// lane 0 = ts, lane 1 = ingest. Returns (ts epoch seconds or BAD, ingest epoch seconds).
+#[inline(always)]
+unsafe fn parse_pair_f1(t: *const u8, g: *const u8) -> (i64, i64) {
+    let a = _mm256_loadu2_m128i(g as *const __m128i, t as *const __m128i);
+    let b = _mm256_loadu2_m128i(g.add(3) as *const __m128i, t.add(3) as *const __m128i);
+    let sep = _mm_setr_epi8(0, b'-' as i8, 0, 0, b'-' as i8, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0, b':' as i8, 0, 0);
+    let sepok = (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm256_castsi256_si128(b), sep)) & 0x2492) == 0x2492;
+    let ia = _mm256_setr_epi8(
+        0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -128, -128, -128, -128,
+        0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -128, -128, -128, -128,
+    );
+    let ib = _mm256_setr_epi8(
+        -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, 14, 15, -128, -128,
+        -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, 14, 15, -128, -128,
+    );
+    let v = _mm256_sub_epi8(_mm256_or_si256(_mm256_shuffle_epi8(a, ia), _mm256_shuffle_epi8(b, ib)), _mm256_set1_epi8(b'0' as i8));
+    let nine = _mm256_set1_epi8(9);
+    let dig = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_max_epu8(v, nine), nine)) as u32;
+    let pr = _mm256_maddubs_epi16(v, _mm256_set1_epi16(0x010A)); // 16-bit [Y1, Y2, MO, D, H, MI, S, x]
+    let mx = _mm256_setr_epi16(99, 99, 12, 31, 23, 59, 59, 32767, 99, 99, 12, 31, 23, 59, 59, 32767);
+    let gt = _mm256_movemask_epi8(_mm256_cmpgt_epi16(pr, mx)) as u32;
+    let q = _mm256_madd_epi16(pr, _mm256_setr_epi16(100, 1, 32, 1, 3600, 60, 1, 0, 100, 1, 32, 1, 3600, 60, 1, 0));
+    let q = _mm256_sllv_epi32(q, _mm256_setr_epi32(9, 0, 0, 0, 9, 0, 0, 0));
+    let h = _mm256_hadd_epi32(q, q); // per lane [year * 512 + mo * 32 + d, h * 3600 + mi * 60 + s, ..]
+    let tx = _mm_cvtsi128_si64(_mm256_castsi256_si128(h)) as u64;
+    let gx = _mm_cvtsi128_si64(_mm256_extracti128_si256::<1>(h)) as u64;
+    let ti = (tx as u32).wrapping_sub(2000 * 512);
+    let gi = (gx as u32).wrapping_sub(2000 * 512);
+    let ing = if gi < 64 * 512 && (gt >> 16) & 0x3FFF == 0 && *DAYTAB.get_unchecked(gi as usize) != i32::MIN {
+        *DAYTAB.get_unchecked(gi as usize) as i64 * 86400 + (gx >> 32) as i64
+    } else {
+        parse_dt_simd(g)
+    };
+    let ts = if sepok && (dig & 0x3FFF) == 0x3FFF && (gt & 0xFFFF) == 0 {
+        if ti < 64 * 512 {
+            let dd = *DAYTAB.get_unchecked(ti as usize);
+            if dd == i32::MIN {
+                BAD
+            } else {
+                dd as i64 * 86400 + (tx >> 32) as i64
+            }
+        } else {
+            parse_dt(t)
+        }
+    } else {
+        BAD
+    };
+    (ts, ing)
+}
 /// ingest_ts is always a valid F1 timestamp (rules.md), so only the digits are converted here.
 /// Falls back to the validating parser for years outside the table. Reads p[0..19].
 #[inline(always)]
@@ -538,6 +588,17 @@ unsafe fn parse_price(p: *const u8, len: usize) -> u32 {
 }
 
 // ---------------------------------------------------------------- line splitting
+#[cfg(target_feature = "avx512bw")]
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
+    let a = _mm512_loadu_si512(p as *const _);
+    (
+        _mm512_cmpeq_epi8_mask(a, _mm512_set1_epi8(b'\n' as i8)),
+        _mm512_cmpeq_epi8_mask(a, _mm512_set1_epi8(b',' as i8)),
+        _mm512_cmpeq_epi8_mask(a, _mm512_set1_epi8(b'"' as i8)),
+    )
+}
+#[cfg(not(target_feature = "avx512bw"))]
 #[inline(always)]
 unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     let a = _mm256_loadu_si256(p as *const __m256i);
@@ -731,6 +792,115 @@ unsafe fn split_gen<const NF: usize>(p: *const u8, maxlen: usize, st: &mut [u32;
     *st.get_unchecked_mut(NF - 1) = a;
     *en.get_unchecked_mut(NF - 1) = l as u32;
     (l, 1 + (qn != 0) as u32)
+}
+#[derive(Default, Clone, Copy)]
+struct Sp7 {
+    kind: u32, // 0 ok, 1 malformed, 2 needs the general splitter
+    len: u32,
+    c: [u32; 6],
+    e: u32,
+    qa: u64,
+    qb: u64,
+}
+impl Sp7 {
+    /// (start, len) of field k with quotes stripped (window A: fields 0..2, window B: 3..6)
+    #[inline(always)]
+    fn field(&self, k: usize) -> (usize, usize) {
+        let b0 = self.c[2] + 1;
+        let (s, x, q) = match k {
+            0 => (0, self.c[0], self.qa),
+            1 => (self.c[0] + 1, self.c[1], self.qa),
+            2 => (self.c[1] + 1, self.c[2], self.qa),
+            3 => (0, self.c[3], self.qb),
+            4 => (self.c[3] + 1, self.c[4], self.qb),
+            5 => (self.c[4] + 1, self.c[5], self.qb),
+            _ => (self.c[5] + 1, self.e, self.qb),
+        };
+        let f = ((q >> s) & 1) as u32;
+        let off = if k >= 3 { b0 } else { 0 };
+        ((off + s + f) as usize, (x - s - 2 * f) as usize)
+    }
+}
+/// Two-window event splitter (generator-exact): window A = 64 bytes at the line start holds the
+/// first three commas; window B = 64 bytes after the third comma holds the other three and the newline.
+#[inline(always)]
+unsafe fn split_ev7f(p: *const u8, maxlen: usize) -> Sp7 {
+    let mut r = Sp7::default();
+    let (na, ca, qa) = masks64(p);
+    let m1 = ca & ca.wrapping_sub(1);
+    let m2 = m1 & m1.wrapping_sub(1);
+    let c2 = m2.trailing_zeros();
+    if m2 == 0 || (na & _bzhi_u64(!0u64, c2)) != 0 {
+        r.kind = 2;
+        return r;
+    }
+    let pb = p.add(c2 as usize + 1);
+    let (nb, cb, qb) = masks64(pb);
+    let e = nb.trailing_zeros();
+    let len = c2 + 1 + e;
+    if nb == 0 || len as usize > maxlen {
+        r.kind = 2;
+        return r;
+    }
+    let cbm = cb & _bzhi_u64(!0u64, e);
+    let qn = (qa & _bzhi_u64(!0u64, c2)).count_ones() + (qb & _bzhi_u64(!0u64, e)).count_ones();
+    r.len = len;
+    if cbm.count_ones() != 3 || (qn & 1) != 0 {
+        r.kind = 1;
+        return r;
+    }
+    let n1 = cbm & cbm.wrapping_sub(1);
+    let n2 = n1 & n1.wrapping_sub(1);
+    r.c = [ca.trailing_zeros(), m1.trailing_zeros(), c2, cbm.trailing_zeros(), n1.trailing_zeros(), n2.trailing_zeros()];
+    r.e = e;
+    r.qa = qa;
+    r.qb = qb;
+    r
+}
+#[derive(Default, Clone, Copy)]
+struct Sp4 {
+    kind: u32, // 0 ok, 1 malformed, 2 needs the general splitter
+    len: u32,
+    c: [u32; 3],
+    e: u32,
+    q: u64,
+}
+impl Sp4 {
+    #[inline(always)]
+    fn field(&self, k: usize) -> (usize, usize) {
+        let (s, x) = match k {
+            0 => (0, self.c[0]),
+            1 => (self.c[0] + 1, self.c[1]),
+            2 => (self.c[1] + 1, self.c[2]),
+            _ => (self.c[2] + 1, self.e),
+        };
+        let f = ((self.q >> s) & 1) as u32;
+        ((s + f) as usize, (x - s - 2 * f) as usize)
+    }
+}
+/// Single-window click splitter (generator-exact): the whole line within 64 bytes.
+#[inline(always)]
+unsafe fn split_ck4f(p: *const u8, maxlen: usize) -> Sp4 {
+    let mut r = Sp4::default();
+    let (n, c, q) = masks64(p);
+    let e = n.trailing_zeros();
+    if n == 0 || e as usize > maxlen {
+        r.kind = 2;
+        return r;
+    }
+    let m = _bzhi_u64(!0u64, e);
+    let cm = c & m;
+    r.len = e;
+    if cm.count_ones() != 3 || ((q & m).count_ones() & 1) != 0 {
+        r.kind = 1;
+        return r;
+    }
+    let m1 = cm & cm.wrapping_sub(1);
+    let m2 = m1 & m1.wrapping_sub(1);
+    r.c = [cm.trailing_zeros(), m1.trailing_zeros(), m2.trailing_zeros()];
+    r.e = e;
+    r.q = q;
+    r
 }
 /// Full 128-byte variant of split_gen for long lines. In the generator, quotes only ever wrap whole
 /// fields, values never contain quotes, and its two quote faults (a stray quote at the start or end
@@ -972,9 +1142,13 @@ struct LSlot {
     key: u64,
     person: u64, // person hash (in names map: name loc = pos << 24 | len)
 }
+/// 4 slots per 64-byte line: a lookup touches one cache line (overflow goes to the next bucket)
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct LBucket([LSlot; 4]);
 struct LinkMap {
-    mask: usize,
-    slots: Vec<LSlot>,
+    mask: usize, // bucket mask
+    slots: Vec<LBucket>,
     names: Vec<LSlot>,
     nmask: usize,
 }
@@ -983,12 +1157,14 @@ impl LinkMap {
     unsafe fn get(&self, k: u64) -> Option<&LSlot> {
         let mut i = k as usize & self.mask;
         loop {
-            let s = self.slots.get_unchecked(i);
-            if s.key == k {
-                return Some(s);
-            }
-            if s.key == 0 {
-                return None;
+            let b = self.slots.get_unchecked(i);
+            for s in b.0.iter() {
+                if s.key == k {
+                    return Some(s);
+                }
+                if s.key == 0 {
+                    return None;
+                }
             }
             i = (i + 1) & self.mask;
         }
@@ -1025,7 +1201,7 @@ unsafe fn prefix_of(loc: u64) -> u64 {
 }
 unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
     if raw.is_empty() {
-        return LinkMap { mask: 0, slots: vec![LSlot { key: 0, person: 0 }], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 };
+        return LinkMap { mask: 0, slots: vec![LBucket([LSlot { key: 0, person: 0 }; 4])], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 };
     }
     let cap = (raw.len() * 4).next_power_of_two().max(16);
     let mask = cap - 1;
@@ -1100,10 +1276,10 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
             minid[r] = i as u32;
         }
     }
-    // compact final table: id hash -> person hash, load factor <= 0.5
-    let fcap = (n * 2).next_power_of_two().max(16);
+    // final table: id hash -> person hash, 4-slot buckets, load factor <= 0.75
+    let fcap = n.div_ceil(3).next_power_of_two().max(4);
     let fmask = fcap - 1;
-    let mut fin = vec![LSlot { key: 0, person: 0 }; fcap];
+    let mut fin = vec![LBucket([LSlot { key: 0, person: 0 }; 4]); fcap];
     let mut nroots = 0usize;
     for i in 0..n {
         if parent[i] as usize == i {
@@ -1117,10 +1293,15 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
         let m = minid[parent[i] as usize] as usize;
         let h = hashes[i];
         let mut j = h as usize & fmask;
-        while fin[j].key != 0 {
+        'ins: loop {
+            for s in fin[j].0.iter_mut() {
+                if s.key == 0 {
+                    *s = LSlot { key: h, person: hashes[m] };
+                    break 'ins;
+                }
+            }
             j = (j + 1) & fmask;
         }
-        fin[j] = LSlot { key: h, person: hashes[m] };
         if parent[i] as usize == i {
             let ph = hashes[m];
             let mut j = ph as usize & nmask;
@@ -1516,7 +1697,14 @@ fn selftest() {
                 let r = parse_dt(p);
                 let v = parse_dt_simd(p);
                 let w = if r != BAD { parse_ingest(p) } else { r };
-                (r, if v != r { v } else { w })
+                let fixed = b"....................2027-12-19T18:14:52Z,,,,,,,,,,,,,,,,";
+                let gp = if r != BAD { p } else { fixed.as_ptr().add(20) };
+                let (pt, pg) = parse_pair_f1(p, gp);
+                let ok_pair = pt == r && pg == parse_dt(gp);
+                if !ok_pair {
+                    eprintln!("PAIR MISMATCH {:?}: {} {} vs {} {}", String::from_utf8_lossy(&f), pt, pg, r, parse_dt(gp));
+                }
+                (r, if v != r { v } else if !ok_pair { r + 1 } else { w })
             }
         } else {
             (0, 0)
@@ -1534,7 +1722,42 @@ fn selftest() {
 
 const LEAK: bool = option_env!("SS_LEAK_BUILD").is_some();
 
+extern "C" {
+    fn execv(path: *const i8, argv: *const *const i8) -> i32;
+}
+
+/// The image carries an x86-64-v4 (AVX-512) build next to this one; switch to it when the CPU has
+/// every v4 feature (SS_NO_V4 keeps this build).
+fn maybe_exec_v4() {
+    #[cfg(not(target_feature = "avx512bw"))]
+    {
+        if std::env::var_os("SS_NO_V4").is_some() {
+            return;
+        }
+        let ok = is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512cd")
+            && is_x86_feature_detected!("avx512dq")
+            && is_x86_feature_detected!("avx512vl");
+        if !ok {
+            return;
+        }
+        let Ok(me) = std::env::current_exe() else { return };
+        let v4 = me.with_file_name("pipeline-v4");
+        if !v4.exists() {
+            return;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(v4.as_os_str().as_bytes()).unwrap();
+        let args: Vec<std::ffi::CString> = std::env::args_os().map(|a| std::ffi::CString::new(a.as_bytes()).unwrap()).collect();
+        let mut argv: Vec<*const i8> = args.iter().map(|a| a.as_ptr()).collect();
+        argv.push(std::ptr::null());
+        unsafe { execv(path.as_ptr(), argv.as_ptr()) };
+    }
+}
+
 fn main() {
+    maybe_exec_v4();
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
     let (data_dir, out_dir) = if args.len() >= 3 {
@@ -1727,7 +1950,7 @@ fn main() {
     let ck2: Vec<Sh<Vec<Vec<RecC>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let cells: Vec<Sh<Vec<Cell>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let assists: Vec<Sh<Vec<u32>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
-    let linkmap: Sh<LinkMap> = Sh::new(LinkMap { mask: 0, slots: vec![LSlot { key: 0, person: 0 }], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 });
+    let linkmap: Sh<LinkMap> = Sh::new(LinkMap { mask: 0, slots: vec![LBucket([LSlot { key: 0, person: 0 }; 4])], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 });
     let next_chunk = AtomicUsize::new(0);
     let next_p1 = AtomicUsize::new(0);
     let next_q = AtomicUsize::new(0);
@@ -1735,7 +1958,7 @@ fn main() {
     let _ = std::fs::create_dir_all(format!("{out_dir}/user_daily"));
     let _ = std::fs::create_dir_all(format!("{out_dir}/campaign_daily"));
     if timing {
-        eprintln!("setup {:?} threads={} p1={} p1c={} q={} chunks={}", t0.elapsed(), nthreads, p1, p1c, q, chunks.len());
+        eprintln!("setup {:?} v4={} threads={} p1={} p1c={} q={} chunks={}", t0.elapsed(), cfg!(target_feature = "avx512bw"), nthreads, p1, p1c, q, chunks.len());
     }
 
     std::thread::scope(|sc| {
@@ -1772,7 +1995,8 @@ fn main() {
                     }
                     *linkmap.get() = build_links(&raw);
                     if timing {
-                        eprintln!("links done {:?} ({} links)", t0.elapsed(), raw.len());
+                        let lmr = &*linkmap.get();
+                        eprintln!("links done {:?} ({} links, table {} MB, names {} MB)", t0.elapsed(), raw.len(), lmr.slots.len() * 64 >> 20, lmr.names.len() * 16 >> 20);
                     }
                 }
                 // ================= stage 1: parse
@@ -1806,49 +2030,51 @@ fn main() {
                         s = s.max(i + 1);
                     }
                     if c.kind == 0 {
-                        while s < c.b {
-                            let p = base().add(s);
-                            let (len, r) = split_ev::<7>(strict, p, c.fe - s, &mut st, &mut en);
-                            let line = s;
-                            s += len + 1;
-                            let qd = r == 2;
-                            let (f0, l0) = fldq(p, &st, &en, 0, qd);
-                            if r == 0 || l0 == 0 || abl == 1 {
+                        macro_rules! ev_body {
+                            ($p:expr, $line:expr, $fld:expr) => {
+                            let (f0, l0) = $fld(0);
+                            if l0 == 0 || abl == 1 {
                                 continue;
                             }
-                            let h = hash(p.add(f0), l0);
+                            let h = hash($p.add(f0), l0);
                             let part = (((h >> 32) * p1 as u64) >> 32) as usize;
                             if abl == 2 { abl_sink += h; continue; }
-                            let (f3, il) = fldq(p, &st, &en, 3, qd);
-                            let ip = p.add(f3);
-                            let ing = if il == 20 && *ip.add(19) == b'Z' { parse_ingest(ip) } else { BAD };
+                            let (f3, il) = $fld(3);
+                            let ip = $p.add(f3);
+                            let (f2, l2) = $fld(2);
+                            let tp = $p.add(f2);
+                            let ing_ok = il == 20 && *ip.add(19) == b'Z';
+                            let (t, ing) = if l2 == 20 && *tp.add(19) == b'Z' && ing_ok {
+                                let (ts, g) = parse_pair_f1(tp, ip);
+                                (if ts == BAD { BAD } else { ts * 1000 }, g)
+                            } else {
+                                (parse_ts_fast(tp, l2), if ing_ok { parse_ingest(ip) } else { BAD })
+                            };
                             let ing_rel = if ing == BAD { 0xFF_FFFF } else { (ing - ing_base).clamp(0, 0xFF_FFFE) as u32 };
-                            let mut rec = Rec { user: 0, pp: (line as u64) << 24, eh: h, ts: INVALID, ic: ing_rel << 8 };
+                            let mut rec = Rec { user: 0, pp: ($line as u64) << 24, eh: h, ts: INVALID, ic: ing_rel << 8 };
                             'v: {
-                                let (f1, ulen) = fldq(p, &st, &en, 1, qd);
-                                let (f5, l5) = fldq(p, &st, &en, 5, qd);
+                                let (f1, ulen) = $fld(1);
+                                let (f5, l5) = $fld(5);
                                 if ulen == 0 || l5 == 0 {
                                     break 'v;
                                 }
-                                let (f2, l2) = fldq(p, &st, &en, 2, qd);
-                                let t = parse_ts_fast(p.add(f2), l2);
                                 if t < ws || t >= we {
                                     break 'v;
                                 }
-                                let (f4, tl) = fldq(p, &st, &en, 4, qd);
-                                let tp = p.add(f4);
+                                let (f4, tl) = $fld(4);
+                                let tp = $p.add(f4);
                                 if tl == 4 {
                                     let w = rd32(tp);
                                     if w != u32::from_le_bytes(*b"view") && w != u32::from_le_bytes(*b"cart") {
                                         break 'v;
                                     }
                                 } else if tl == 8 && rd64(tp) == u64::from_le_bytes(*b"purchase") {
-                                    let (f6, l6) = fldq(p, &st, &en, 6, qd);
-                                    let price = parse_price(p.add(f6), l6);
+                                    let (f6, l6) = $fld(6);
+                                    let price = parse_price($p.add(f6), l6);
                                     if price == 0 {
                                         break 'v;
                                     }
-                                    let cat = prod_tab.get(p.add(f5), l5).unwrap_or(cat_unknown);
+                                    let cat = prod_tab.get($p.add(f5), l5).unwrap_or(cat_unknown);
                                     rec.pp |= price as u64;
                                     rec.ic |= cat;
                                 } else {
@@ -1857,38 +2083,84 @@ fn main() {
                                 if ing != BAD && ing * 1000 - t > DAY_MS {
                                     break 'v;
                                 }
-                                rec.user = hash(p.add(f1), ulen);
+                                rec.user = hash($p.add(f1), ulen);
                                 rec.ts = (t - base_ms) as u32;
                             }
                             if abl == 3 { abl_sink += rec.user + rec.ts as u64; continue; }
                             wc1.push(evb, part, rec);
+                            };
+                        }
+                        while s < c.b {
+                            let p = base().add(s);
+                            let sp = if strict { Sp7 { kind: 2, ..Default::default() } } else { split_ev7f(p, c.fe - s) };
+                            if sp.kind >= 1 {
+                                // malformed, or a shape the fast splitter does not take: general path
+                                let (len, ok) = if strict {
+                                    splitn::<7>(p, c.fe - s, &mut st, &mut en)
+                                } else if sp.kind == 1 {
+                                    (sp.len as usize, false)
+                                } else {
+                                    let (l, r) = split_gen_full::<7>(p, c.fe - s, &mut st, &mut en);
+                                    if r == 2 {
+                                        for k in 0..7 {
+                                            let (a, b) = (st[k], en[k]);
+                                            let q = (a < b && *p.add(a as usize) == b'"') as u32;
+                                            st[k] = a + q;
+                                            en[k] = b - q;
+                                        }
+                                    }
+                                    (l, r != 0)
+                                };
+                                let line = s;
+                                s += len + 1;
+                                if !ok {
+                                    continue;
+                                }
+                                let fld = |k: usize| -> (usize, usize) { (st[k] as usize, (en[k] - st[k]) as usize) };
+                                ev_body!(p, line, fld);
+                                continue;
+                            }
+                            let line = s;
+                            s += sp.len as usize + 1;
+                            let fld = |k: usize| -> (usize, usize) { sp.field(k) };
+                            ev_body!(p, line, fld);
                         }
                     } else {
                         while s < c.b {
                             let p = base().add(s);
-                            let (len, r) = split_ev::<4>(strict, p, c.fe - s, &mut st, &mut en);
+                            let sp = if strict { Sp4 { kind: 2, ..Default::default() } } else { split_ck4f(p, c.fe - s) };
                             let line = s;
-                            s += len + 1;
-                            let qd = r == 2;
-                            let (f0, l0) = fldq(p, &st, &en, 0, qd);
-                            let (f1, l1) = fldq(p, &st, &en, 1, qd);
+                            let (r, fs) = if sp.kind == 0 {
+                                s += sp.len as usize + 1;
+                                (1u32, [sp.field(0), sp.field(1), sp.field(2), sp.field(3)])
+                            } else if sp.kind == 1 {
+                                s += sp.len as usize + 1;
+                                continue;
+                            } else {
+                                let (len, r) = split_ev::<4>(strict, p, c.fe - s, &mut st, &mut en);
+                                s += len + 1;
+                                let qd = r == 2;
+                                (r, [fldq(p, &st, &en, 0, qd), fldq(p, &st, &en, 1, qd), fldq(p, &st, &en, 2, qd), fldq(p, &st, &en, 3, qd)])
+                            };
+                            let ((f0, l0), (f1, l1), (f2, l2), (f3, l3)) = (fs[0], fs[1], fs[2], fs[3]);
                             if r == 0 || l0 == 0 || l1 == 0 {
                                 continue;
                             }
-                            let (f3, l3) = fldq(p, &st, &en, 3, qd);
                             let t = parse_ts_fast(p.add(f3), l3);
                             if t < base_ms || t >= we {
                                 continue;
                             }
-                            let (f2, l2) = fldq(p, &st, &en, 2, qd);
                             let camp = match camp_tab.get(p.add(f2), l2) {
                                 Some(c) => c,
                                 None => continue,
                             };
-                            let h = hash(p.add(f0), l0);
+                            let uh = hash(p.add(f1), l1);
+                            // clicks are only deduplicated under SS_CLICK_DEDUP (see stage 2); otherwise
+                            // partition by user and skip hashing click_id (ties use the id bytes directly)
+                            let h = if click_dedup { hash(p.add(f0), l0) } else { uh };
                             let part = (((h >> 32) * p1c as u64) >> 32) as usize;
                             wcc1.push(ckb, part, RecC {
-                                user: hash(p.add(f1), l1),
+                                user: uh,
                                 pc: ((line as u64) << 16) | camp as u64,
                                 ts: (t - base_ms) as u32,
                                 kh: h as u32,
