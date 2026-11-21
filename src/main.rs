@@ -772,6 +772,41 @@ unsafe fn split_gen_full<const NF: usize>(p: *const u8, maxlen: usize, st: &mut 
     *en.get_unchecked_mut(NF - 1) = l as u32;
     (l, 1 + (qn != 0) as u32)
 }
+/// Stable LSD radix sort of packed events (ts in bits 32..63) by ts: 3 passes of 11 bits.
+fn radix_ts(v: &mut [u64], tmp: &mut Vec<u64>) {
+    let n = v.len();
+    tmp.clear();
+    tmp.resize(n, 0);
+    let mut src: *mut u64 = v.as_mut_ptr();
+    let mut dst: *mut u64 = tmp.as_mut_ptr();
+    for pass in 0..3u32 {
+        let shift = 32 + 11 * pass;
+        let mut cnt = [0u32; 2048];
+        unsafe {
+            for i in 0..n {
+                cnt[((*src.add(i) >> shift) & 2047) as usize] += 1;
+            }
+            let mut acc = 0u32;
+            for c in cnt.iter_mut() {
+                let x = *c;
+                *c = acc;
+                acc += x;
+            }
+            for i in 0..n {
+                let x = *src.add(i);
+                let d = ((x >> shift) & 2047) as usize;
+                *dst.add(cnt[d] as usize) = x;
+                cnt[d] += 1;
+            }
+        }
+        std::mem::swap(&mut src, &mut dst);
+    }
+    // after 3 passes the result is in tmp (odd number of swaps): copy back
+    if src != v.as_mut_ptr() {
+        unsafe { std::ptr::copy_nonoverlapping(src, v.as_mut_ptr(), n) };
+    }
+}
+
 /// Strip field k's quotes (if the line has quotes): (start, len).
 #[inline(always)]
 unsafe fn fldq(p: *const u8, st: &[u32; 8], en: &[u32; 8], k: usize, quoted: bool) -> (usize, usize) {
@@ -2085,8 +2120,10 @@ fn main() {
                 let mut out = UOut::default();
                 let mut gt = GTable { keys: Vec::new(), vals: Vec::new(), mask: 0 };
                 let mut gids: Vec<u32> = Vec::new();
+                let mut rtmp: Vec<u64> = Vec::new();
                 let mut vals: Vec<u64> = Vec::new();
                 let mut cgids: Vec<u32> = Vec::new();
+                let mut ctmp: Vec<(u32, u32, u64)> = Vec::new();
                 let mut eoff: Vec<u32> = Vec::new();
                 let mut coff: Vec<u32> = Vec::new();
                 let mut ginfo: Vec<u64> = Vec::new(); // pos << 1 | linked ; and person
@@ -2189,6 +2226,7 @@ fn main() {
                     coff.clear();
                     coff.resize(ng + 1, 0);
                     cgids.clear();
+                    ctmp.clear();
                     let mut ncl = 0usize;
                     if nc > 0 {
                         for t in 0..nthreads {
@@ -2205,8 +2243,9 @@ fn main() {
                                     }
                                     idx = (idx + 1) & gt.mask;
                                 };
-                                cgids.push(g);
                                 if g != u32::MAX {
+                                    cgids.push(g);
+                                    ctmp.push((r.ts, (r.pc & 0xFFFF) as u32, r.pc >> 16));
                                     *coff.get_unchecked_mut(g as usize) += 1;
                                     ncl += 1;
                                 }
@@ -2220,17 +2259,11 @@ fn main() {
                         }
                         cks.clear();
                         cks.resize(ncl, (0, 0, 0));
-                        let mut i = 0;
-                        for t in 0..nthreads {
-                            for r in ck2[t].get()[qi].iter() {
-                                let g = *cgids.get_unchecked(i);
-                                i += 1;
-                                if g != u32::MAX {
-                                    let o = coff.get_unchecked_mut(g as usize);
-                                    *cks.get_unchecked_mut(*o as usize) = (r.ts, (r.pc & 0xFFFF) as u32, r.pc >> 16);
-                                    *o += 1;
-                                }
-                            }
+                        for i in 0..cgids.len() {
+                            let g = *cgids.get_unchecked(i);
+                            let o = coff.get_unchecked_mut(g as usize);
+                            *cks.get_unchecked_mut(*o as usize) = *ctmp.get_unchecked(i);
+                            *o += 1;
                         }
                         for g in (1..=ng).rev() {
                             coff[g] = coff[g - 1];
@@ -2240,7 +2273,11 @@ fn main() {
                     // per person
                     for g in 0..ng {
                         let ev = &mut evs[eoff[g] as usize..eoff[g + 1] as usize];
-                        if ev.len() > 1 {
+                        if ev.len() > 1024 {
+                            // big persons (whales, shared devices): stable LSD radix sort on ts
+                            // (events with equal ts may come in any order without changing results)
+                            radix_ts(ev, &mut rtmp);
+                        } else if ev.len() > 1 {
                             ev.sort_unstable();
                         }
                         let ck = &mut cks[coff[g] as usize..coff[g + 1] as usize];

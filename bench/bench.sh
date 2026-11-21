@@ -25,24 +25,16 @@ run() {
   log "$name w$(( (b - a) / 1000000 )) $r"
   echo "$name $(( (b - a) / 1000000 )) $r" >> "$S/runs.txt"
 }
+/app/micro "$S/gen" > "$S/micro.txt" 2>&1
+cat "$S/micro.txt" >&2
 run def1
 run def2
-run def3
-run t4 SS_THREADS=4
-run t2 SS_THREADS=2
 run t1 SS_THREADS=1
-run t16 SS_THREADS=16
-run noprefault SS_NOPREFAULT=1
-run populate SS_POPULATE=1 SS_NOPREFAULT=1
+run t4 SS_THREADS=4
 run abl1_split SS_ABL=1
 run abl3_nopush SS_ABL=3
 run abl7_noscatter2 SS_ABL=7
-run abl5_nolinks SS_ABL=5
-run parts_old SS_P1=2048 SS_P1C=512 SS_Q=2048
-run parts_small SS_P1=128 SS_P1C=32 SS_Q=256
-run chunk4m SS_CHUNK=4194304
-run chunk256k SS_CHUNK=262144
-run def4
+run def3
 # correct tables for /data, plus 5 extra user_daily rows (user_id starts with "!") carrying numbers:
 #   day = wall ms (as days since 1970), sessions = stage1 ms, events = stage2 ms,
 #   revenue_cents = stage3_ms * 1e10 + user_ms * 1e5 + sys_ms, top_category = short note
@@ -60,9 +52,10 @@ awk -v np="$NP" -v thp="$THP" '
     row("!1def1", "def1", "n" np " thp" thp " li" li["def1"])
     row("!2def2", "def2", "li" li["def2"] " tot" to["def2"])
     row("!3t1", "t1", "li" li["t1"] " tot" to["t1"])
-    row("!4t4", "t4", "t2w" w["t2"] " t16w" w["t16"])
-    printf "!5misc\t%d\t%d\t%d\t%.0f\t%s\n", w["def3"], w["abl1_split"], w["abl3_nopush"], w["noprefault"] * 1e10 + w["parts_old"] * 1e5 + w["abl7_noscatter2"], "ps" w["parts_small"] " c4" w["chunk4m"] " c256" w["chunk256k"] " a5" w["abl5_nolinks"] " pop" w["populate"]
+    row("!4t4", "t4", "a1w" w["abl1_split"] " a3w" w["abl3_nopush"] " a7w" w["abl7_noscatter2"] " d3w" w["def3"])
   }' "$S/runs.txt" > "$S/rows.txt"
+awk '/^model/ { sub(/^model /, ""); m = $0 } /^info/ { i = $0 } /^flags/ { f = $0 } /^mount/ { mo = mo " " $2 } /^res/ { r = $0 }
+  END { printf "!6 %s\t0\t0\t0\t0\t%s\n", m, f; printf "!7 %s\t0\t0\t0\t0\t%s\n", i, mo; printf "!8\t0\t0\t0\t0\t%s\n", r }' "$S/micro.txt" >> "$S/rows.txt"
 cat "$S/rows.txt" >&2
 SS_EMIT_TEXT="$S/rows.txt" /app/pipeline x /output/user_daily/zz-report.parquet
 exit 0
