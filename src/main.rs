@@ -623,6 +623,64 @@ unsafe fn splitn<const NF: usize>(p: *const u8, maxlen: usize, st: &mut [u32; 8]
     (l, true)
 }
 
+/// Splitter for generated data (events and clicks). In the generator, quotes only ever wrap whole
+/// fields, values never contain quotes, and its two quote faults (a stray quote at the start or end
+/// of a line) always leave an odd number of quotes; so on generated lines, quote-count parity decides
+/// validity exactly. Returns raw bounds and 0 = malformed, 1 = ok without quotes, 2 = ok with quotes.
+/// SS_STRICT=1 switches back to the fully general splitter (used to cross-check).
+#[inline(always)]
+unsafe fn split_gen<const NF: usize>(p: *const u8, maxlen: usize, st: &mut [u32; 8], en: &mut [u32; 8]) -> (usize, u32) {
+    let (nl0, c0, q0) = masks64(p);
+    let (nl1, c1, q1) = masks64(p.add(64));
+    let l = if nl0 != 0 { nl0.trailing_zeros() as usize } else if nl1 != 0 { 64 + nl1.trailing_zeros() as usize } else { 128 };
+    let l = l.min(maxlen);
+    if l >= 128 {
+        let (l2, ok) = split_slow(p, maxlen, NF, st, en);
+        return (l2, ok as u32); // bounds already stripped
+    }
+    let mlo = _bzhi_u64(!0u64, l as u32);
+    let mhi = _bzhi_u64(!0u64, l.saturating_sub(64) as u32);
+    let mut lo = c0 & mlo;
+    let mut hi = c1 & mhi;
+    let qn = (q0 & mlo).count_ones() + (q1 & mhi).count_ones();
+    if (lo.count_ones() + hi.count_ones()) as usize != NF - 1 || (qn & 1) != 0 {
+        return (l, 0);
+    }
+    let mut a = 0u32;
+    for k in 0..NF - 1 {
+        let use_lo = lo != 0;
+        let x = if use_lo { lo.trailing_zeros() } else { 64 + hi.trailing_zeros() };
+        let lo2 = lo & lo.wrapping_sub(1);
+        let hi2 = hi & hi.wrapping_sub(1);
+        lo = if use_lo { lo2 } else { lo };
+        hi = if use_lo { hi } else { hi2 };
+        *st.get_unchecked_mut(k) = a;
+        *en.get_unchecked_mut(k) = x;
+        a = x + 1;
+    }
+    *st.get_unchecked_mut(NF - 1) = a;
+    *en.get_unchecked_mut(NF - 1) = l as u32;
+    (l, 1 + (qn != 0) as u32)
+}
+/// Strip field k's quotes (if the line has quotes): (start, len).
+#[inline(always)]
+unsafe fn fldq(p: *const u8, st: &[u32; 8], en: &[u32; 8], k: usize, quoted: bool) -> (usize, usize) {
+    let (s, e) = (*st.get_unchecked(k), *en.get_unchecked(k));
+    // an empty field's first byte is its separator, never a quote, so no length check is needed
+    let f = (quoted & (*p.add(s as usize) == b'"')) as u32;
+    ((s + f) as usize, (e - s - 2 * f) as usize)
+}
+/// Events/clicks splitter dispatch: generator-exact fast path, or the general one under SS_STRICT.
+#[inline(always)]
+unsafe fn split_ev<const NF: usize>(strict: bool, p: *const u8, maxlen: usize, st: &mut [u32; 8], en: &mut [u32; 8]) -> (usize, u32) {
+    if strict {
+        let (l, ok) = splitn::<NF>(p, maxlen, st, en);
+        (l, ok as u32) // already stripped; fldq on 'quoted=false' leaves them as is
+    } else {
+        split_gen::<NF>(p, maxlen, st, en)
+    }
+}
+
 #[cold]
 #[inline(never)]
 unsafe fn split_slow(p: *const u8, maxlen: usize, nf: usize, st: &mut [u32; 8], en: &mut [u32; 8]) -> (usize, bool) {
@@ -1389,6 +1447,7 @@ fn main() {
     let timing = std::env::var("SS_TIMING").is_ok();
     let prefault = std::env::var("SS_NOPREFAULT").is_err();
     let click_dedup = std::env::var("SS_CLICK_DEDUP").is_ok();
+    let strict = std::env::var("SS_STRICT").is_ok();
     let abl: usize = std::env::var("SS_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(99);
     let envn = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
     let nthreads = envn("SS_THREADS")
@@ -1601,42 +1660,47 @@ fn main() {
                     if c.kind == 0 {
                         while s < c.b {
                             let p = base().add(s);
-                            let (len, ok) = splitn::<7>(p, c.fe - s, &mut st, &mut en);
+                            let (len, r) = split_ev::<7>(strict, p, c.fe - s, &mut st, &mut en);
                             let line = s;
                             s += len + 1;
-                            if !ok || en[0] == st[0] || abl == 1 {
+                            let qd = r == 2;
+                            let (f0, l0) = fldq(p, &st, &en, 0, qd);
+                            if r == 0 || l0 == 0 || abl == 1 {
                                 continue;
                             }
-                            let h = hash(p.add(st[0] as usize), (en[0] - st[0]) as usize);
+                            let h = hash(p.add(f0), l0);
                             let part = (((h >> 32) * p1 as u64) >> 32) as usize;
                             if abl == 2 { abl_sink += h; continue; }
-                            let il = (en[3] - st[3]) as usize;
-                            let ip = p.add(st[3] as usize);
+                            let (f3, il) = fldq(p, &st, &en, 3, qd);
+                            let ip = p.add(f3);
                             let ing = if il == 20 && *ip.add(19) == b'Z' { parse_ingest(ip) } else { BAD };
                             let ing_rel = if ing == BAD { 0xFF_FFFF } else { (ing - ing_base).clamp(0, 0xFF_FFFE) as u32 };
                             let mut rec = Rec { user: 0, pp: (line as u64) << 24, eh: h, ts: INVALID, ic: ing_rel << 8 };
                             'v: {
-                                let ulen = (en[1] - st[1]) as usize;
-                                if ulen == 0 || en[5] == st[5] {
+                                let (f1, ulen) = fldq(p, &st, &en, 1, qd);
+                                let (f5, l5) = fldq(p, &st, &en, 5, qd);
+                                if ulen == 0 || l5 == 0 {
                                     break 'v;
                                 }
-                                let t = parse_ts_fast(p.add(st[2] as usize), (en[2] - st[2]) as usize);
+                                let (f2, l2) = fldq(p, &st, &en, 2, qd);
+                                let t = parse_ts_fast(p.add(f2), l2);
                                 if t < ws || t >= we {
                                     break 'v;
                                 }
-                                let tp = p.add(st[4] as usize);
-                                let tl = en[4] - st[4];
+                                let (f4, tl) = fldq(p, &st, &en, 4, qd);
+                                let tp = p.add(f4);
                                 if tl == 4 {
                                     let w = rd32(tp);
                                     if w != u32::from_le_bytes(*b"view") && w != u32::from_le_bytes(*b"cart") {
                                         break 'v;
                                     }
                                 } else if tl == 8 && rd64(tp) == u64::from_le_bytes(*b"purchase") {
-                                    let price = parse_price(p.add(st[6] as usize), (en[6] - st[6]) as usize);
+                                    let (f6, l6) = fldq(p, &st, &en, 6, qd);
+                                    let price = parse_price(p.add(f6), l6);
                                     if price == 0 {
                                         break 'v;
                                     }
-                                    let cat = prod_tab.get(p.add(st[5] as usize), (en[5] - st[5]) as usize).unwrap_or(cat_unknown);
+                                    let cat = prod_tab.get(p.add(f5), l5).unwrap_or(cat_unknown);
                                     rec.pp |= price as u64;
                                     rec.ic |= cat;
                                 } else {
@@ -1645,7 +1709,7 @@ fn main() {
                                 if ing != BAD && ing * 1000 - t > DAY_MS {
                                     break 'v;
                                 }
-                                rec.user = hash(p.add(st[1] as usize), ulen);
+                                rec.user = hash(p.add(f1), ulen);
                                 rec.ts = (t - base_ms) as u32;
                             }
                             if abl == 3 { abl_sink += rec.user + rec.ts as u64; continue; }
@@ -1654,24 +1718,29 @@ fn main() {
                     } else {
                         while s < c.b {
                             let p = base().add(s);
-                            let (len, ok) = splitn::<4>(p, c.fe - s, &mut st, &mut en);
+                            let (len, r) = split_ev::<4>(strict, p, c.fe - s, &mut st, &mut en);
                             let line = s;
                             s += len + 1;
-                            if !ok || en[0] == st[0] || en[1] == st[1] {
+                            let qd = r == 2;
+                            let (f0, l0) = fldq(p, &st, &en, 0, qd);
+                            let (f1, l1) = fldq(p, &st, &en, 1, qd);
+                            if r == 0 || l0 == 0 || l1 == 0 {
                                 continue;
                             }
-                            let t = parse_ts_fast(p.add(st[3] as usize), (en[3] - st[3]) as usize);
+                            let (f3, l3) = fldq(p, &st, &en, 3, qd);
+                            let t = parse_ts_fast(p.add(f3), l3);
                             if t < base_ms || t >= we {
                                 continue;
                             }
-                            let camp = match camp_tab.get(p.add(st[2] as usize), (en[2] - st[2]) as usize) {
+                            let (f2, l2) = fldq(p, &st, &en, 2, qd);
+                            let camp = match camp_tab.get(p.add(f2), l2) {
                                 Some(c) => c,
                                 None => continue,
                             };
-                            let h = hash(p.add(st[0] as usize), (en[0] - st[0]) as usize);
+                            let h = hash(p.add(f0), l0);
                             let part = (((h >> 32) * p1c as u64) >> 32) as usize;
                             ckb.get_unchecked_mut(part).push(RecC {
-                                user: hash(p.add(st[1] as usize), (en[1] - st[1]) as usize),
+                                user: hash(p.add(f1), l1),
                                 pc: ((line as u64) << 16) | camp as u64,
                                 ts: (t - base_ms) as u32,
                                 kh: h,
