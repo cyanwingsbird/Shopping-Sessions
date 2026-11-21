@@ -936,6 +936,9 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     k
 }
 const SCAN: usize = 1 << 16;
+/// stage 3: partitions of at least SUB3MIN events are split into SUB3 pieces by person hash
+const SUB3: usize = 4;
+const SUB3MIN: usize = 32768;
 /// stage-2 scatter: staging-slot prefetch distance (0 = none)
 const PFW: usize = 0;
 /// stage-3 grouping: hash-slot prefetch distance (0 = none)
@@ -943,7 +946,7 @@ const PFG: usize = 0;
 /// stage-2 dedup: table bucket prefetch distance (0 = none)
 const PFD2: usize = 8;
 /// pin each thread to one of the allowed CPUs
-const PIN: bool = true;
+const PIN: bool = false;
 /// stage 2: link-table prefetch distance (records)
 const PF2: usize = 24;
 /// clicks are mapped to persons this many clicks after their link-table line was prefetched
@@ -951,7 +954,7 @@ const CRING: usize = 8;
 /// SS_ABL ablations (diagnostic builds only)
 const DIAG: bool = false;
 /// records per partition staged before a streaming write in stage 1 (32-byte records)
-const WC1K: usize = 8;
+const WC1K: usize = 4;
 /// stage-2 output blocks recycled from consumed stage-1 memory
 const RECYCLE: bool = true;
 /// stage 3 ts radix: 3 passes of 11 bits (else 4 of 8)
@@ -2581,12 +2584,12 @@ fn main() {
                         macro_rules! ev_body {
                             ($p:expr, $line:expr, $fld:expr) => {
                             let (f0, l0) = $fld(0);
-                            if l0 == 0 || (DIAG && abl == 1) {
+                            if l0 == 0 || DIAG && abl == 1 {
                                 continue;
                             }
                             let h = hash($p.add(f0), l0);
                             let part = (((h >> 32) * p1 as u64) >> 32) as usize;
-                            if (DIAG && abl == 2) { abl_sink += h; continue; }
+                            if DIAG && abl == 2 { abl_sink += h; continue; }
                             let (f3, il) = $fld(3);
                             let ip = $p.add(f3);
                             let (f2, l2) = $fld(2);
@@ -2636,7 +2639,7 @@ fn main() {
                                 rec.user = hash($p.add(f1), ulen);
                                 rec.ts = (t - base_ms) as u32;
                             }
-                            if (DIAG && abl == 3) { abl_sink += rec.user + rec.ts as u64; continue; }
+                            if DIAG && abl == 3 { abl_sink += rec.user + rec.ts as u64; continue; }
                             wc1.push(evb, part, rec);
                             };
                         }
@@ -2702,7 +2705,7 @@ fn main() {
                             let line_at = s;
                             s = s0 + *nlbuf.get_unchecked(j) as usize + 1;
                             let p = base().add(line_at);
-                            if (DIAG && abl == 0) {
+                            if DIAG && abl == 0 {
                                 abl_sink += line_at as u64;
                                 continue;
                             }
@@ -2920,7 +2923,7 @@ fn main() {
                             table32.resize(nb * 16 + 16, 0);
                             let tb = ((table32.as_mut_ptr() as usize + 63) & !63) as *mut u32;
                             for s in &slices {
-                                if (DIAG && abl == 6) {
+                                if DIAG && abl == 6 {
                                     break;
                                 }
                                 for i in 0..s.1 {
@@ -2969,7 +2972,7 @@ fn main() {
                             }
                         } else {
                             for s in &slices {
-                                if (DIAG && abl == 6) { break; }
+                                if DIAG && abl == 6 { break; }
                                 for i in 0..s.1 {
                                     let r = &mut *s.0.add(i);
                                     let h24 = r.eh & 0xFFFF_FFFF;
@@ -3017,11 +3020,6 @@ fn main() {
                                         lm.prefetch(recs.get_unchecked(i + PF2).user);
                                     }
                                     let r = recs.get_unchecked_mut(i);
-                                    if timing {
-                                        let fi = (r.user >> 32) as usize & lm.fmask;
-                                        let bit = (*lm.filt.get_unchecked(fi >> 6) >> (fi & 63)) & 1;
-                                        GROWS.fetch_add(bit + ((lm.map(r.user).1 as u64) << 32), Relaxed);
-                                    }
                                     let (pu, linked) = lm.map(r.user);
                                     r.eh = pu;
                                     r.user = linked as u64;
@@ -3040,7 +3038,7 @@ fn main() {
                                     }
                                     let o = Rec2 { user: r.eh, pos: ((r.pp >> 24) << 1) | r.user, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
                                     let part = (((o.user >> 32) * q as u64) >> 32) as usize;
-                                    if (DIAG && abl == 7) { abl_sink += o.user; continue; }
+                                    if DIAG && abl == 7 { abl_sink += o.user; continue; }
                                     wc2.push(e2, &mut pool, part, o);
                                 }
                             }
@@ -3065,7 +3063,7 @@ fn main() {
                                     o.pos |= linked as u64;
                                 }
                                 let part = (((o.user >> 32) * q as u64) >> 32) as usize;
-                                if (DIAG && abl == 7) { abl_sink += o.user; continue; }
+                                if DIAG && abl == 7 { abl_sink += o.user; continue; }
                                 wc2.push(e2, &mut pool, part, o);
                             }
                         }
@@ -3180,6 +3178,8 @@ fn main() {
                 let mut cgids: Vec<u32> = Vec::new();
                 let mut ctmp: Vec<(u32, u32, u64)> = Vec::new();
                 let mut ctmp2: Vec<(u32, u32, u64)> = Vec::new();
+                let mut sbe: Vec<Vec<Rec2>> = (0..SUB3).map(|_| Vec::new()).collect();
+                let mut sbc: Vec<Vec<RecC>> = (0..SUB3).map(|_| Vec::new()).collect();
                 let mut cg2: Vec<u32> = Vec::new();
                 let mut eoff: Vec<u32> = Vec::new();
                 let mut coff: Vec<u32> = Vec::new();
@@ -3208,11 +3208,50 @@ fn main() {
                         break;
                     }
                     let qi = qorder[qn].1 as usize;
-                    let n: usize = (0..nthreads).map(|t| ev2[t].get()[qi].len()).sum();
+                    let ntot: usize = (0..nthreads).map(|t| ev2[t].get()[qi].len()).sum();
+                    if ntot == 0 {
+                        continue;
+                    }
+                    // the partition's record slices: blocks of every thread
+                    let mut eall: Vec<(*const Rec2, usize)> = Vec::new();
+                    for t in 0..nthreads {
+                        let bv = &ev2[t].get()[qi];
+                        for (bi, &bp) in bv.blocks.iter().enumerate() {
+                            eall.push((bp, if bi + 1 == bv.blocks.len() { bv.last } else { BLK }));
+                        }
+                    }
+                    let call: Vec<(*const RecC, usize)> = (0..nthreads).map(|t| (ck2[t].get()[qi].as_ptr(), ck2[t].get()[qi].len())).collect();
+                    // big partitions: split by person hash first, so that each piece's working set stays in L2
+                    let nsub = if ntot >= SUB3MIN { SUB3 } else { 1 };
+                    if nsub > 1 {
+                        for v in sbe.iter_mut() {
+                            v.clear();
+                        }
+                        for v in sbc.iter_mut() {
+                            v.clear();
+                        }
+                        for &(p, l) in &eall {
+                            for r in std::slice::from_raw_parts(p, l) {
+                                sbe.get_unchecked_mut(r.user as usize & (SUB3 - 1)).push(*r);
+                            }
+                        }
+                        for &(p, l) in &call {
+                            for r in std::slice::from_raw_parts(p, l) {
+                                sbc.get_unchecked_mut(r.user as usize & (SUB3 - 1)).push(*r);
+                            }
+                        }
+                    }
+                    for sub in 0..nsub {
+                    let (es, cs): (Vec<(*const Rec2, usize)>, Vec<(*const RecC, usize)>) = if nsub > 1 {
+                        (vec![(sbe[sub].as_ptr(), sbe[sub].len())], vec![(sbc[sub].as_ptr(), sbc[sub].len())])
+                    } else {
+                        (eall.clone(), call.clone())
+                    };
+                    let n: usize = es.iter().map(|x| x.1).sum();
                     if n == 0 {
                         continue;
                     }
-                    let nc: usize = (0..nthreads).map(|t| ck2[t].get()[qi].len()).sum();
+                    let nc: usize = cs.iter().map(|x| x.1).sum();
                     let t3a = tsc();
                     // group ids
                     let mut cap = (n / 4).next_power_of_two().max(1024);
@@ -3224,10 +3263,8 @@ fn main() {
                     eoff.clear();
                     ginfo.clear();
                     gperson.clear();
-                    for t in 0..nthreads {
-                        let bv = &ev2[t].get()[qi];
-                        for (bi, &bp) in bv.blocks.iter().enumerate() {
-                        let blen = if bi + 1 == bv.blocks.len() { bv.last } else { BLK };
+                    {
+                        for &(bp, blen) in &es {
                         let rs = std::slice::from_raw_parts(bp, blen);
                         for (ri, r) in rs.iter().enumerate() {
                             if PFG > 0 && ri + PFG < rs.len() {
@@ -3282,7 +3319,9 @@ fn main() {
                     }
                     eoff.push(acc);
                     let tg1 = if PHASE_FINE { tsc() } else { 0 };
-                    ph[6] += tg1 - t3a;
+                    if PHASE_FINE {
+                        ph[6] += tg1 - t3a;
+                    }
                     if RADIX3 {
                         // order the partition by ts first (LSD radix, 4 x 8 bits, stable; all four
                         // histograms from one read), so that the stable placement by person below leaves
@@ -3365,8 +3404,9 @@ fn main() {
                         // four passes: the sorted data is back in vals/gids
                         }
                     }
-                    let tg2 = if PHASE_FINE { tsc() } else { 0 };
-                    ph[7] += tg2 - tg1;
+                    if PHASE_FINE {
+                        ph[7] += tsc() - tg1;
+                    }
                     evs.clear();
                     evs.resize(n, 0);
                     for i in 0..n {
@@ -3389,8 +3429,8 @@ fn main() {
                     ctmp.clear();
                     let mut ncl = 0usize;
                     if nc > 0 {
-                        for t in 0..nthreads {
-                            for r in ck2[t].get()[qi].iter() {
+                        for &(cp, cl) in &cs {
+                            for r in std::slice::from_raw_parts(cp, cl) {
                                 let k = r.user;
                                 let mut idx = k as usize & gt.mask;
                                 let g = loop {
@@ -3700,6 +3740,7 @@ fn main() {
                         }
                     }
                     ph[5] += tsc() - t3c;
+                    }
                 }
                 perf.stage(2);
                 for (i, v) in ph.iter().enumerate() {
@@ -3835,8 +3876,6 @@ fn main() {
     if timing {
         let el = t0.elapsed().as_secs_f64();
         let _ = el;
-        let gg = GROWS.load(Relaxed);
-        eprintln!("map: filter hits {} found {}", gg & 0xFFFF_FFFF, gg >> 32);
         let names = ["dedup", "map", "clk2", "group", "clk3", "person", "gloop", "radix"];
         let mut line = String::from("phases(Mcyc, all threads)");
         for (i, n) in names.iter().enumerate() {
