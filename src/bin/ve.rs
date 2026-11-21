@@ -287,7 +287,12 @@ unsafe fn hash(p: *const u8, len: usize) -> u64 {
         a = rd64(p.add(len - 16));
         b = rd64(p.add(len - 8));
     }
-    let h = mum(mum(a ^ S1, b ^ seed) ^ (len as u64).wrapping_mul(S0), S0 ^ S1);
+    let h = if HASH1 && len <= 16 {
+        // one 64x64->128 multiply: a and b are masked ASCII, so neither operand can be zero
+        mum(a ^ S1, b ^ S0 ^ ((len as u64) << 59))
+    } else {
+        mum(mum(a ^ S1, b ^ seed) ^ (len as u64).wrapping_mul(S0), S0 ^ S1)
+    };
     h | ((h == 0) as u64)
 }
 
@@ -850,11 +855,16 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     k
 }
 const SCAN: usize = 1 << 16;
+/// ids of up to 16 bytes hashed with a single multiply
+const HASH1: bool = true;
+/// find line ends with a separate pass over each 64 KB block (else: from the splitter, line by line)
+const SCANNL: bool = false;
 /// events are mapped to persons RING events after their link-table line was prefetched
-const RING: usize = 8;
+const RING: usize = 16;
 /// stage 3: radix-sort each partition by ts instead of sorting each person's events
 const RADIX3: bool = true;
 const HIST: bool = false;
+static GROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SIZEH: [std::sync::atomic::AtomicU64; 32] = [const { std::sync::atomic::AtomicU64::new(0) }; 32];
 static SIZEE: [std::sync::atomic::AtomicU64; 32] = [const { std::sync::atomic::AtomicU64::new(0) }; 32];
 
@@ -2370,7 +2380,45 @@ fn main() {
                         if lm1.is_none() && links_ready.load(std::sync::atomic::Ordering::Acquire) {
                             lm1 = Some(linkmap.get());
                         }
-                        'blocks: while s < c.b {
+                        if !SCANNL {
+                            // line by line: the splitter's line length gives the next line's start
+                            while s < c.b {
+                                let line_at = s;
+                                let p = base().add(line_at);
+                                let sp = if strict { Sp7 { kind: 2, ..Default::default() } } else { split_ev7f(p, c.fe - line_at) };
+                                if sp.kind == 0 {
+                                    s = line_at + sp.len as usize + 1;
+                                    let fld = |k: usize| -> (usize, usize) { sp.field(k) };
+                                    ev_body!(p, line_at, fld);
+                                    continue;
+                                }
+                                if sp.kind == 1 {
+                                    s = line_at + sp.len as usize + 1;
+                                    continue;
+                                }
+                                let (l, ok) = if strict {
+                                    splitn::<7>(p, c.fe - line_at, &mut st, &mut en)
+                                } else {
+                                    let (l, r) = split_gen_full::<7>(p, c.fe - line_at, &mut st, &mut en);
+                                    if r == 2 {
+                                        for k in 0..7 {
+                                            let (a, b) = (st[k], en[k]);
+                                            let q = (a < b && *p.add(a as usize) == b'"') as u32;
+                                            st[k] = a + q;
+                                            en[k] = b - q;
+                                        }
+                                    }
+                                    (l, r != 0)
+                                };
+                                s = line_at + l + 1;
+                                if !ok {
+                                    continue;
+                                }
+                                let fld = |k: usize| -> (usize, usize) { (st[k] as usize, (en[k] - st[k]) as usize) };
+                                ev_body!(p, line_at, fld);
+                            }
+                        }
+                        'blocks: while SCANNL && s < c.b {
                         // line ends of the next SCAN bytes first, so that each line's parse does not wait
                         // on the previous line's newline search
                         let scan_end = (s + SCAN).min(c.fe);
@@ -2843,6 +2891,7 @@ fn main() {
                             if eoff.len() * 2 > cap {
                                 // grow
                                 cap *= 4;
+                                if timing { GROWS.fetch_add(1, Relaxed); }
                                 gt.reset(cap);
                                 for (gi, &pk) in gperson.iter().enumerate() {
                                     let mut idx = pk as usize & gt.mask;
@@ -3254,6 +3303,7 @@ fn main() {
     if timing {
         let el = t0.elapsed().as_secs_f64();
         let _ = el;
+        eprintln!("gt grows {}", GROWS.load(Relaxed));
         let names = ["dedup", "map", "clk2", "group", "clk3", "person"];
         let mut line = String::from("phases(Mcyc, all threads)");
         for (i, n) in names.iter().enumerate() {

@@ -215,30 +215,7 @@ struct RecC {
     ts: u32,
     kh: u32, // low bits of the click_id hash (only used by the optional click dedup)
 }
-/// Dedup record of every parsed event copy, scattered by event_id hash: 16 bytes.
-/// x = line pos << 25 | valid << 24 | ingest seconds since ing_base (24 bits, clamped)
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Dd {
-    eh: u64,
-    x: u64,
-}
-/// Losing copies of duplicated events, by line position / 32 (two valid event lines never share a
-/// 32-byte slot: a valid line is at least 46 bytes long). Set in stage 2, read in stage 3.
-static mut LOSER: *mut u64 = std::ptr::null_mut();
-#[inline(always)]
-unsafe fn lose(x: u64) {
-    if (x >> 24) & 1 != 0 {
-        let b = (x >> 30) as usize;
-        (*(LOSER.add(b >> 6) as *const std::sync::atomic::AtomicU64)).fetch_or(1 << (b & 63), Relaxed);
-    }
-}
-#[inline(always)]
-unsafe fn lost(pos: u64) -> bool {
-    let b = (pos >> 5) as usize;
-    (*LOSER.add(b >> 6) >> (b & 63)) & 1 != 0
-}
-/// Event record grouped by person: 24 bytes.
+/// Event record after dedup, grouped by person: 24 bytes.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Rec2 {
@@ -850,8 +827,6 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     k
 }
 const SCAN: usize = 1 << 16;
-/// events are mapped to persons RING events after their link-table line was prefetched
-const RING: usize = 4;
 /// stage 3: radix-sort each partition by ts instead of sorting each person's events
 const RADIX3: bool = true;
 const HIST: bool = false;
@@ -2156,14 +2131,7 @@ fn main() {
     let q = envn("SS_Q").unwrap_or_else(|| pow2(est_ev / 32768, 1, 1024));
 
     // ---- shared state
-    let ev1: Vec<Sh<Vec<Vec<Dd>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
-    let pend: Vec<Sh<Vec<Rec2>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
-    {
-        let words = (total >> 5) / 64 + 2;
-        let v: Vec<u64> = vec![0u64; words];
-        unsafe { LOSER = v.as_ptr() as *mut u64 };
-        std::mem::forget(v);
-    }
+    let ev1: Vec<Sh<Vec<Vec<Rec>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let ck1: Vec<Sh<Vec<Vec<RecC>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let ev2: Vec<Sh<Vec<Vec<Rec2>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let ck2: Vec<Sh<Vec<Vec<RecC>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
@@ -2186,7 +2154,6 @@ fn main() {
             let (chunks, ev1, ck1, ev2, ck2, cells, linkmap, assists) = (&chunks, &ev1, &ck1, &ev2, &ck2, &cells, &linkmap, &assists);
             let (next_chunk, next_p1, next_q, barrier) = (&next_chunk, &next_p1, &next_q, &barrier);
             let links_ready = &links_ready;
-            let pend = &pend;
             let (prod_tab, camp_tab, ln_segs, cat_names, cat_rank, out_dir) = (&prod_tab, &camp_tab, &ln_segs, &cat_names, &cat_rank, &out_dir);
             let body = move || unsafe {
                 let mut perf = Perf::open(perf_on);
@@ -2234,17 +2201,7 @@ fn main() {
                 *ckb = (0..p1c).map(|_| Vec::with_capacity(est_ck / (p1c * nthreads) * 17 / 16 + 64)).collect();
                 let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
                 let mut abl_sink = 0u64;
-                let mut wc1: Wc<Dd, 4> = Wc::new(p1);
-                // person records: straight to the person partitions once the links are ready, before
-                // that to this thread's pending list (mapped in stage 2)
-                let e2 = ev2[tid].get();
-                *e2 = (0..q).map(|_| Vec::with_capacity(est_ev / (q * nthreads) * 5 / 4 + 64)).collect();
-                let mut wc2: Wc<Rec2, 8> = Wc::new(q);
-                let pl = pend[tid].get();
-                // map with a delay of 4 events, so that the link-table line prefetched for an event
-                // has arrived when it is used
-                let mut ring = [Rec2 { user: 0, pos: 0, ts: 0, pc: 0 }; RING];
-                let mut rn = 0usize;
+                let mut wc1: Wc<Rec, 4> = Wc::new(p1);
                 let mut nlbuf: Vec<u32> = vec![0u32; SCAN + 64];
                 let mut wcc1: Wc<RecC, 8> = Wc::new(p1c);
                 // clicks need no dedup (copies are identical): their chunks come last in stage 1, when the
@@ -2309,8 +2266,8 @@ fn main() {
                             } else {
                                 (parse_ts_fast(tp, l2), if ing_ok { parse_ingest(ip) } else { BAD })
                             };
-                            let ing_rel = if ing == BAD { 0xFF_FFFF } else { (ing - ing_base).clamp(0, 0xFF_FFFE) as u64 };
-                            let mut o = Rec2 { user: 0, pos: ($line as u64) << 1, ts: INVALID, pc: 0 };
+                            let ing_rel = if ing == BAD { 0xFF_FFFF } else { (ing - ing_base).clamp(0, 0xFF_FFFE) as u32 };
+                            let mut rec = Rec { user: 0, pp: ($line as u64) << 24, eh: h, ts: INVALID, ic: ing_rel << 8 };
                             'v: {
                                 let (f1, ulen) = $fld(1);
                                 let (f5, l5) = $fld(5);
@@ -2336,39 +2293,20 @@ fn main() {
                                         break 'v;
                                     }
                                     let cat = prod_tab.get($p.add(f5), l5).unwrap_or(cat_unknown);
-                                    o.pc = (price << 8) | cat;
+                                    rec.pp |= price as u64;
+                                    rec.ic |= cat;
                                 } else {
                                     break 'v;
                                 }
                                 if ing != BAD && ing * 1000 - t > DAY_MS {
                                     break 'v;
                                 }
-                                o.user = hash($p.add(f1), ulen);
-                                o.ts = (t - base_ms) as u32;
+                                rec.user = hash($p.add(f1), ulen);
+                                rec.ts = (t - base_ms) as u32;
                             }
-                            let valid = (o.ts != INVALID) as u64;
-                            if abl == 3 { abl_sink += o.user + o.ts as u64; continue; }
-                            wc1.push(evb, part, Dd { eh: h, x: (($line as u64) << 25) | (valid << 24) | ing_rel });
-                            if valid != 0 {
-                                if let Some(l) = lm1 {
-                                    l.prefetch(o.user);
-                                    let d = std::mem::replace(ring.get_unchecked_mut(rn & (RING - 1)), o);
-                                    rn += 1;
-                                    if rn > RING {
-                                        let mut d = d;
-                                        let (pu, linked) = l.map(d.user);
-                                        d.user = pu;
-                                        d.pos |= linked as u64;
-                                        wc2.push(e2, (((pu >> 32) * q as u64) >> 32) as usize, d);
-                                    }
-                                } else {
-                                    pl.push(o);
-                                }
-                            }
+                            if abl == 3 { abl_sink += rec.user + rec.ts as u64; continue; }
+                            wc1.push(evb, part, rec);
                             };
-                        }
-                        if lm1.is_none() && links_ready.load(std::sync::atomic::Ordering::Acquire) {
-                            lm1 = Some(linkmap.get());
                         }
                         'blocks: while s < c.b {
                         // line ends of the next SCAN bytes first, so that each line's parse does not wait
@@ -2505,15 +2443,6 @@ fn main() {
                         }
                     }
                 }
-                if let Some(l) = lm1 {
-                    for k in rn.saturating_sub(RING)..rn {
-                        let mut d = ring[k & (RING - 1)];
-                        let (pu, linked) = l.map(d.user);
-                        d.user = pu;
-                        d.pos |= linked as u64;
-                        wc2.push(e2, (((pu >> 32) * q as u64) >> 32) as usize, d);
-                    }
-                }
                 wc1.finish(evb);
                 wcc1.finish(ckb);
                 if ck_direct {
@@ -2527,11 +2456,14 @@ fn main() {
                 if stop == 1 {
                     _exit(0);
                 }
-                // ================= stage 2: dedup (losing copies go to the LOSER bitmap); pending events to persons
+                // ================= stage 2: dedup, translate to person, scatter
                 let lm: &LinkMap = linkmap.get();
                 let has_links = lm.mask != 0 && abl != 5;
+                let e2 = ev2[tid].get();
+                *e2 = (0..q).map(|_| Vec::with_capacity(est_ev / (q * nthreads) * 5 / 4 + 64)).collect();
                 let mut table: Vec<u64> = Vec::new();
                 let mut table32: Vec<u32> = Vec::new();
+                let mut wc2: Wc<Rec2, 8> = Wc::new(q);
                 let mut ph = [0u64; 8];
                 loop {
                     let pi = next_p1.fetch_add(1, Relaxed);
@@ -2539,7 +2471,7 @@ fn main() {
                         break;
                     }
                     if pi < p1 {
-                        let slices: Vec<(*mut Dd, usize)> = (0..nthreads)
+                        let slices: Vec<(*mut Rec, usize)> = (0..nthreads)
                             .map(|t| {
                                 let v = &mut ev1[t].get()[pi];
                                 (v.as_mut_ptr(), v.len())
@@ -2553,7 +2485,7 @@ fn main() {
                             table.clear();
                             table.resize(cap, 0);
                         }
-                        let resolve = |gi: usize| -> *mut Dd {
+                        let resolve = |gi: usize| -> *mut Rec {
                             let mut g = gi;
                             for s in &slices {
                                 if g < s.1 {
@@ -2599,11 +2531,11 @@ fn main() {
                                             let e = *p.add(j);
                                             let o = &mut *resolve(((e & 0xF_FFFF) - 1) as usize);
                                             if o.eh == r.eh {
-                                                if (r.x & 0xFF_FFFF) < (o.x & 0xFF_FFFF) {
-                                                    lose(o.x);
+                                                if (r.ic >> 8) < (o.ic >> 8) {
+                                                    o.ts = DEAD;
                                                     *p.add(j) = (tag << 20) | (gi as u32 + 1);
                                                 } else {
-                                                    lose(r.x);
+                                                    r.ts = DEAD;
                                                 }
                                                 break 'probe;
                                             }
@@ -2633,11 +2565,11 @@ fn main() {
                                         if e >> 32 == h24 {
                                             let o = &mut *resolve((e as u32 - 1) as usize);
                                             if o.eh == r.eh {
-                                                if (r.x & 0xFF_FFFF) < (o.x & 0xFF_FFFF) {
-                                                    lose(o.x);
+                                                if (r.ic >> 8) < (o.ic >> 8) {
+                                                    o.ts = DEAD;
                                                     *table.get_unchecked_mut(idx) = (h24 << 32) | (gi as u64 + 1);
                                                 } else {
-                                                    lose(r.x);
+                                                    r.ts = DEAD;
                                                 }
                                                 break;
                                             }
@@ -2651,7 +2583,28 @@ fn main() {
                         }
                         let tb = tsc();
                         ph[0] += tb - ta;
-                        let _ = (has_links, tb);
+                        for s in &slices {
+                            let recs = std::slice::from_raw_parts(s.0, s.1);
+                            for i in 0..recs.len() {
+                                if has_links && i + 24 < recs.len() {
+                                    lm.prefetch(recs.get_unchecked(i + 24).user);
+                                }
+                                let r = recs.get_unchecked(i);
+                                if r.ts >= 0x8000_0000 {
+                                    continue;
+                                }
+                                let mut o = Rec2 { user: r.user, pos: (r.pp >> 24) << 1, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
+                                if has_links {
+                                    let (pu, linked) = lm.map(r.user);
+                                    o.user = pu;
+                                    o.pos |= linked as u64;
+                                }
+                                let part = (((o.user >> 32) * q as u64) >> 32) as usize;
+                                if abl == 7 { abl_sink += o.user; continue; }
+                                wc2.push(e2, part, o);
+                            }
+                        }
+                        ph[1] += tsc() - tb;
                     } else {
                         let tc = tsc();
                         let pi = pi - p1;
@@ -2728,22 +2681,6 @@ fn main() {
                         ph[2] += tsc() - tc;
                     }
                 }
-                {
-                    // events parsed before the links were ready
-                    let tb = tsc();
-                    let pr = pend[tid].get();
-                    for i in 0..pr.len() {
-                        if i + 16 < pr.len() {
-                            lm.prefetch(pr.get_unchecked(i + 16).user);
-                        }
-                        let mut d = *pr.get_unchecked(i);
-                        let (pu, linked) = lm.map(d.user);
-                        d.user = pu;
-                        d.pos |= linked as u64;
-                        wc2.push(e2, (((pu >> 32) * q as u64) >> 32) as usize, d);
-                    }
-                    ph[1] += tsc() - tb;
-                }
                 wc2.finish(e2);
                 if !ck_direct {
                     wcc2.finish(c2);
@@ -2810,15 +2747,7 @@ fn main() {
                     ginfo.clear();
                     gperson.clear();
                     for t in 0..nthreads {
-                        let rs = &ev2[t].get()[qi];
-                        for (ri, r) in rs.iter().enumerate() {
-                            if ri + 16 < rs.len() {
-                                let b = (rs.get_unchecked(ri + 16).pos >> 6) as usize;
-                                _mm_prefetch(LOSER.add(b >> 6) as *const i8, _MM_HINT_T0);
-                            }
-                            if lost(r.pos >> 1) {
-                                continue;
-                            }
+                        for r in ev2[t].get()[qi].iter() {
                             let k = r.user;
                             let mut idx = k as usize & gt.mask;
                             let g = loop {
@@ -2856,7 +2785,6 @@ fn main() {
                         }
                     }
                     let ng = eoff.len();
-                    let n = vals.len();
                     // prefix sums (eoff[g] = start)
                     let mut acc = 0u32;
                     for x in eoff.iter_mut() {
