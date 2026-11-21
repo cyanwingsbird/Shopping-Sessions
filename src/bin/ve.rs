@@ -1008,12 +1008,18 @@ const RELEASE: bool = true;
 const NAMECP: bool = true;
 /// stage 1: ISO ts with an offset parsed with ingest_ts in the same SIMD pass as the Z form
 const ISOM: bool = true;
+/// input page tables dropped in 32 MB pieces by threads done writing, once stage 3 is over everywhere
+const RELEASE2: bool = true;
+/// stage-3 assists: day block of each session kept, pdays ends with a sentinel
+const ASBLK: bool = false;
+/// link build: all ids first, then the unions with the parent entries prefetched
+const LINK2: bool = false;
 /// MADV_WILLNEED on every input file at startup (serial; useless on the scorer's tmpfs)
 const WILLNEED: bool = false;
 /// stage-3 person table: initial capacity n / GTDIV slots (grows when half full)
 const GTDIV: usize = 4;
 /// stage-3 ts radix on (ts, index) keys only; gid and price fetched by index when placing
-const RADIXK: bool = false;
+const RADIXK: bool = true;
 /// stage-2 dedup table: one 16-slot bucket per DDIV records (rounded up to a power of two)
 const DDIV: usize = 8;
 /// stage 1: user hash and type check before the timestamps (shorter live ranges)
@@ -2054,6 +2060,7 @@ struct S3 {
     cpos: Vec<u32>,
     active: Vec<u32>,
     name_buf: Vec<u8>,
+    sblk: Vec<u32>,
 }
 struct S3Ctx<'a> {
     lm: &'a LinkMap,
@@ -2068,7 +2075,7 @@ struct S3Ctx<'a> {
 #[allow(unused_mut, unused_variables)]
 unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &mut S3, out: &mut UOut, cell: &mut [Cell], asst_cells: &mut [u32], cx: &S3Ctx, ph: &mut [u64; 8]) {
     let S3Ctx { lm, cat_names, cat_rank, ncamp, nd, day_off, day_base } = *cx;
-    let S3 { gt, gids, rtmp, rv2, rg2, vals, cgids, ctmp, ctmp2, cg2, eoff, coff, ginfo, gperson, evs, cks, catsum, touched, ccnt, astart, pdays, cpos, active, name_buf } = b;
+    let S3 { gt, gids, rtmp, rv2, rg2, vals, cgids, ctmp, ctmp2, cg2, eoff, coff, ginfo, gperson, evs, cks, catsum, touched, ccnt, astart, pdays, cpos, active, name_buf, sblk } = b;
     let n: usize = es.iter().map(|x| x.1).sum();
     if n == 0 {
         return;
@@ -2486,11 +2493,29 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
         let mut i = 0;
         let mut sidx = 0u32;
         pdays.clear();
+        if ASBLK {
+            pdays.push((u32::MAX, u32::MAX));
+            sblk.clear();
+        }
         // add sessions [i0, i1) of campaign a to its assists, day by day
         macro_rules! assist {
             ($a:expr, $i0:expr, $i1:expr) => {{
                 let (a, i0, i1) = ($a as usize, $i0, $i1);
-                if i1 > i0 {
+                if ASBLK && i1 > i0 {
+                    // sessions [i0, i1) day block by day block: the block of session i0 is known, and
+                    // pdays ends with a sentinel (no bounds checks)
+                    let mut k = *sblk.get_unchecked(i0 as usize) as usize;
+                    loop {
+                        let (d, s0) = *pdays.get_unchecked(k);
+                        let s1 = pdays.get_unchecked(k + 1).1;
+                        let (lo, hi) = (i0.max(s0), i1.min(s1));
+                        *asst_cells.get_unchecked_mut(a * nd + d as usize) += hi - lo;
+                        k += 1;
+                        if pdays.get_unchecked(k).1 >= i1 {
+                            break;
+                        }
+                    }
+                } else if i1 > i0 {
                     let mut k = pdays.len() - 1;
                     while pdays.get_unchecked(k).1 > i0 {
                         k -= 1;
@@ -2561,7 +2586,10 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
                     flush!();
                 }
                 cur_day = day;
-                if ASSIST_IV {
+                if ASBLK {
+                    *pdays.last_mut().unwrap_unchecked() = (day, sidx);
+                    pdays.push((u32::MAX, u32::MAX));
+                } else if ASSIST_IV {
                     pdays.push((day, sidx));
                 }
                 r_sessions = 0;
@@ -2647,6 +2675,9 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
                         *asst_cells.get_unchecked_mut(a as usize * nd + day as usize) += 1;
                     }
                 }
+            }
+            if ASBLK {
+                sblk.push((pdays.len() - 2) as u32);
             }
             sidx += 1;
             let ce = cell.get_unchecked_mut(camp * nd + day as usize);
@@ -2829,14 +2860,40 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
             }
         }};
     }
-    for (i, l) in raw.iter().enumerate() {
-        if i + 8 < raw.len() {
-            let n = raw.get_unchecked(i + 8);
-            _mm_prefetch(sp.add(n.ha as usize & mask) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(sp.add(n.hb as usize & mask) as *const i8, _MM_HINT_T0);
+    // ids first (table probes prefetched), then the unions (parent entries prefetched): the two
+    // kinds of random access do not wait on each other
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    if LINK2 {
+        pairs.reserve(raw.len());
+        for (i, l) in raw.iter().enumerate() {
+            if i + 8 < raw.len() {
+                let n = raw.get_unchecked(i + 8);
+                _mm_prefetch(sp.add(n.ha as usize & mask) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(sp.add(n.hb as usize & mask) as *const i8, _MM_HINT_T0);
+            }
+            let a = intern!(l.ha, l.la);
+            let b = intern!(l.hb, l.lb);
+            pairs.push((a, b));
         }
-        let a = intern!(l.ha, l.la);
-        let b = intern!(l.hb, l.lb);
+    }
+    let npairs = if LINK2 { pairs.len() } else { raw.len() };
+    for i in 0..npairs {
+        let (a, b) = if LINK2 {
+            if i + 16 < npairs {
+                let (na, nb) = *pairs.get_unchecked(i + 16);
+                _mm_prefetch(parent.as_ptr().add(na as usize) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(parent.as_ptr().add(nb as usize) as *const i8, _MM_HINT_T0);
+            }
+            *pairs.get_unchecked(i)
+        } else {
+            let l = raw.get_unchecked(i);
+            if i + 8 < raw.len() {
+                let n = raw.get_unchecked(i + 8);
+                _mm_prefetch(sp.add(n.ha as usize & mask) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(sp.add(n.hb as usize & mask) as *const i8, _MM_HINT_T0);
+            }
+            (intern!(l.ha, l.la), intern!(l.hb, l.lb))
+        };
         let pp = parent.as_mut_ptr();
         let mut ra = a;
         while *pp.add(ra as usize) != ra {
@@ -3666,6 +3723,8 @@ fn main() {
     let links_ready = std::sync::atomic::AtomicBool::new(false);
     let next_p1 = AtomicUsize::new(0);
     let next_q = AtomicUsize::new(0);
+    let s3_done = AtomicUsize::new(0);
+    let rel_next = AtomicUsize::new(0);
     let barrier = Barrier::new(nthreads);
     let cpus: Vec<usize> = {
         let mut m = [0u64; 16];
@@ -3701,6 +3760,7 @@ fn main() {
         for tid in 0..nthreads {
             let (chunks, ev1, ck1, ev2, ck2, cells, linkmap, assists) = (&chunks, &ev1, &ck1, &ev2, &ck2, &cells, &linkmap, &assists);
             let (next_chunk, next_p1, next_q, barrier) = (&next_chunk, &next_p1, &next_q, &barrier);
+            let (s3_done, rel_next) = (&s3_done, &rel_next);
             let links_ready = &links_ready;
             let (lchunks, next_lchunk, lraw) = (&lchunks, &next_lchunk, &lraw);
             let (camp_tab, camp_short, ln_segs, out_dir) = (&camp_tab, &camp_short, &ln_segs, &out_dir);
@@ -4575,7 +4635,7 @@ fn main() {
                 let mut cpos = vec![0u32; ncamp + 1];
                 let mut active: Vec<u32> = Vec::new();
                 let mut name_buf: Vec<u8> = Vec::new();
-                let mut s3b = S3 { gt: GTable { keys: Vec::new(), vals: Vec::new(), mask: 0 }, gids: Vec::new(), rtmp: Vec::new(), rv2: Vec::new(), rg2: Vec::new(), vals: Vec::new(), cgids: Vec::new(), ctmp: Vec::new(), ctmp2: Vec::new(), cg2: Vec::new(), eoff: Vec::new(), coff: Vec::new(), ginfo: Vec::new(), gperson: Vec::new(), evs: Vec::new(), cks: Vec::new(), catsum: vec![0u64; 256], touched: Vec::new(), ccnt: vec![0u32; ncamp + 1], astart: vec![0u32; ncamp + 1], pdays: Vec::new(), cpos: vec![0u32; ncamp + 1], active: Vec::new(), name_buf: Vec::new() };
+                let mut s3b = S3 { gt: GTable { keys: Vec::new(), vals: Vec::new(), mask: 0 }, gids: Vec::new(), rtmp: Vec::new(), rv2: Vec::new(), rg2: Vec::new(), vals: Vec::new(), cgids: Vec::new(), ctmp: Vec::new(), ctmp2: Vec::new(), cg2: Vec::new(), eoff: Vec::new(), coff: Vec::new(), ginfo: Vec::new(), gperson: Vec::new(), evs: Vec::new(), cks: Vec::new(), catsum: vec![0u64; 256], touched: Vec::new(), ccnt: vec![0u32; ncamp + 1], astart: vec![0u32; ncamp + 1], pdays: Vec::new(), cpos: vec![0u32; ncamp + 1], active: Vec::new(), name_buf: Vec::new(), sblk: Vec::new() };
                 // biggest partitions first (whale persons), so no thread is left finishing a big one alone
                 let mut qorder: Vec<(usize, u32)> = (0..q)
                     .map(|qi| ((0..nthreads).map(|t| ev2[t].get()[qi].len()).sum::<usize>(), qi as u32))
@@ -5147,6 +5207,9 @@ fn main() {
                     }
                 }
                 perf.stage(2);
+                if RELEASE2 {
+                    s3_done.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
                 for (i, v) in ph.iter().enumerate() {
                     PHASE[i].fetch_add(*v, Relaxed);
                 }
@@ -5182,7 +5245,23 @@ fn main() {
                     }
                 }
                 std::mem::forget(out);
-                if RELEASE {
+                if RELEASE2 {
+                    // drop the input's page-table entries in parallel (left to exit, one thread unmaps them
+                    // all) once every thread is past stage 3; threads that are done writing take 32 MB
+                    // pieces while the last ones still write
+                    while s3_done.load(std::sync::atomic::Ordering::Acquire) < nthreads {
+                        std::hint::spin_loop();
+                    }
+                    const PIECE: usize = 32 << 20;
+                    loop {
+                        let k = rel_next.fetch_add(1, Relaxed);
+                        let a = k * PIECE;
+                        if a >= total {
+                            break;
+                        }
+                        madvise(base().add(a) as *mut u8, PIECE.min(total - a), 4);
+                    }
+                } else if RELEASE {
                     // drop the input's page-table entries in parallel: left to exit, one thread unmaps them all
                     barrier.wait();
                     let step = (total / nthreads + (2 << 20)) & !((2usize << 20) - 1);
