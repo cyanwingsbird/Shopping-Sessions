@@ -832,6 +832,8 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     k
 }
 const SCAN: usize = 1 << 16;
+/// assists counted per activation interval of a campaign instead of per session
+const ASSIST_IV: bool = false;
 /// stage 2: link lookups and scatter in two passes over each partition
 const MAP2: bool = true;
 /// per-person sub-phases in the SS_TIMING report
@@ -849,7 +851,7 @@ const PLINKS: bool = true;
 /// ids of up to 16 bytes hashed with a single multiply
 const HASH1: bool = true;
 /// find line ends with a separate pass over each 64 KB block (else: from the splitter, line by line)
-const SCANNL: bool = true;
+const SCANNL: bool = false;
 /// stage 3: radix-sort each partition by ts instead of sorting each person's events
 const RADIX3: bool = true;
 const HIST: bool = false;
@@ -2877,6 +2879,10 @@ fn main() {
                 let mut catsum = vec![0u64; 256];
                 let mut touched: Vec<u8> = Vec::new();
                 let mut ccnt = vec![0u32; ncamp + 1];
+                // assists by activation interval: astart[c] = index of the first session for which campaign
+                // c (now active) has a click in the window; pdays = (day, index of its first session)
+                let mut astart = vec![0u32; ncamp + 1];
+                let mut pdays: Vec<(u32, u32)> = Vec::new();
                 let mut cpos = vec![0u32; ncamp + 1];
                 let mut active: Vec<u32> = Vec::new();
                 let mut name_buf: Vec<u8> = Vec::new();
@@ -3163,6 +3169,30 @@ fn main() {
                         let mut cur_day = u32::MAX;
                         let (mut r_sessions, mut r_events, mut r_rev) = (0i32, 0i32, 0i64);
                         let mut i = 0;
+                        let mut sidx = 0u32;
+                        pdays.clear();
+                        // add sessions [i0, i1) of campaign a to its assists, day by day
+                        macro_rules! assist {
+                            ($a:expr, $i0:expr, $i1:expr) => {{
+                                let (a, i0, i1) = ($a as usize, $i0, $i1);
+                                if i1 > i0 {
+                                    let mut k = pdays.len() - 1;
+                                    while pdays.get_unchecked(k).1 > i0 {
+                                        k -= 1;
+                                    }
+                                    loop {
+                                        let (d, s0) = *pdays.get_unchecked(k);
+                                        let s1 = if k + 1 < pdays.len() { pdays.get_unchecked(k + 1).1 } else { u32::MAX };
+                                        let (lo, hi) = (i0.max(s0), i1.min(s1));
+                                        *asst_cells.get_unchecked_mut(a * nd + d as usize) += hi - lo;
+                                        k += 1;
+                                        if k == pdays.len() || pdays.get_unchecked(k).1 >= i1 {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }};
+                        }
                         macro_rules! flush {
                             () => {
                                 out.names.extend_from_slice(&(name_buf.len() as u32).to_le_bytes());
@@ -3200,6 +3230,9 @@ fn main() {
                                     flush!();
                                 }
                                 cur_day = day;
+                                if ASSIST_IV {
+                                    pdays.push((day, sidx));
+                                }
                                 r_sessions = 0;
                                 r_events = 0;
                                 r_rev = 0;
@@ -3238,6 +3271,7 @@ fn main() {
                                     if ccnt[c] == 0 {
                                         cpos[c] = active.len() as u32;
                                         active.push(c as u32);
+                                        *astart.get_unchecked_mut(c) = sidx;
                                     }
                                     ccnt[c] += 1;
                                     hi += 1;
@@ -3246,6 +3280,9 @@ fn main() {
                                     let c = ck.get_unchecked(lo).1 as usize;
                                     ccnt[c] -= 1;
                                     if ccnt[c] == 0 {
+                                        if ASSIST_IV {
+                                            assist!(c, *astart.get_unchecked(c), sidx);
+                                        }
                                         let p = cpos[c] as usize;
                                         let last = active.pop().unwrap();
                                         if last as usize != c {
@@ -3274,10 +3311,13 @@ fn main() {
                                         camp = ck.get_unchecked(best).1 as usize;
                                     }
                                 }
-                                for &a in &active {
-                                    *asst_cells.get_unchecked_mut(a as usize * nd + day as usize) += 1;
+                                if !ASSIST_IV {
+                                    for &a in &active {
+                                        *asst_cells.get_unchecked_mut(a as usize * nd + day as usize) += 1;
+                                    }
                                 }
                             }
+                            sidx += 1;
                             let ce = cell.get_unchecked_mut(camp * nd + day as usize);
                             ce.sessions += 1;
                             ce.purch += s_purch;
@@ -3286,6 +3326,9 @@ fn main() {
                         flush!();
                         if nck != 0 {
                             for &a in &active {
+                                if ASSIST_IV {
+                                    assist!(a, *astart.get_unchecked(a as usize), sidx);
+                                }
                                 ccnt[a as usize] = 0;
                             }
                             active.clear();
