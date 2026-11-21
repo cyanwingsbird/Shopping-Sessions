@@ -1963,7 +1963,7 @@ fn main() {
     let click_dedup = std::env::var("SS_CLICK_DEDUP").is_ok();
     let strict = std::env::var("SS_STRICT").is_ok();
     let perf_on = std::env::var("SS_PERF").is_ok();
-    let abl: usize = std::env::var("SS_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(99);
+    let abl: usize = std::env::var("SS_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let envn = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
     let repeat = envn("SS_REPEAT").unwrap_or(1);
     let nthreads = envn("SS_THREADS")
@@ -2278,6 +2278,10 @@ fn main() {
                             let line_at = s;
                             s = s0 + *nlbuf.get_unchecked(j) as usize + 1;
                             let p = base().add(line_at);
+                            if abl == 0 {
+                                abl_sink += line_at as u64;
+                                continue;
+                            }
                             let sp = if strict { Sp7 { kind: 2, ..Default::default() } } else { split_ev7f(p, c.fe - line_at) };
                             if sp.kind >= 1 {
                                 // malformed, or a shape the fast splitter does not take: general path
@@ -2381,7 +2385,7 @@ fn main() {
                 *c2 = (0..q).map(|_| Vec::with_capacity(est_ck / (q * nthreads) * 5 / 4 + 64)).collect();
                 let mut table: Vec<u64> = Vec::new();
                 let mut table32: Vec<u32> = Vec::new();
-                let mut wc2: Wc<Rec2, 4> = Wc::new(q);
+                let mut wc2: Wc<Rec2, 8> = Wc::new(q);
                 let mut ph = [0u64; 8];
                 let mut wcc2: Wc<RecC, 8> = Wc::new(q);
                 loop {

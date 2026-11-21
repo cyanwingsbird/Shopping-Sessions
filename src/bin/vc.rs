@@ -1963,7 +1963,7 @@ fn main() {
     let click_dedup = std::env::var("SS_CLICK_DEDUP").is_ok();
     let strict = std::env::var("SS_STRICT").is_ok();
     let perf_on = std::env::var("SS_PERF").is_ok();
-    let abl: usize = std::env::var("SS_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(99);
+    let abl: usize = std::env::var("SS_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
     let envn = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
     let repeat = envn("SS_REPEAT").unwrap_or(1);
     let nthreads = envn("SS_THREADS")
@@ -2089,7 +2089,7 @@ fn main() {
     let pow2 = |x: usize, lo: usize, hi: usize| x.next_power_of_two().clamp(lo, hi);
     let p1 = envn("SS_P1").unwrap_or_else(|| pow2(est_ev / 32768, 1, 1024));
     let p1c = envn("SS_P1C").unwrap_or_else(|| pow2(est_ck / 65536, 1, 128));
-    let q = envn("SS_Q").unwrap_or_else(|| pow2(est_ev / 16384, 1, 2048));
+    let q = envn("SS_Q").unwrap_or_else(|| pow2(est_ev / 32768, 1, 1024));
 
     // ---- shared state
     let ev1: Vec<Sh<Vec<Vec<Rec>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
@@ -2278,6 +2278,10 @@ fn main() {
                             let line_at = s;
                             s = s0 + *nlbuf.get_unchecked(j) as usize + 1;
                             let p = base().add(line_at);
+                            if abl == 0 {
+                                abl_sink += line_at as u64;
+                                continue;
+                            }
                             let sp = if strict { Sp7 { kind: 2, ..Default::default() } } else { split_ev7f(p, c.fe - line_at) };
                             if sp.kind >= 1 {
                                 // malformed, or a shape the fast splitter does not take: general path
