@@ -1008,6 +1008,8 @@ const RELEASE: bool = true;
 const NAMECP: bool = true;
 /// stage 1: ISO ts with an offset parsed with ingest_ts in the same SIMD pass as the Z form
 const ISOM: bool = true;
+/// stage 1: campaign ids of up to 8 bytes looked up by their bytes
+const CAMPS: bool = true;
 /// stage 2: persons of a partition kept in a side array (stage-1 records not written)
 const PMAP: bool = true;
 /// stage 3: radix-sort each partition by ts instead of sorting each person's events
@@ -1434,6 +1436,74 @@ impl IdTab {
 }
 
 
+/// Exact lookup of ids of 1..=8 bytes by their bytes (one multiply, usually one probe); built from an
+/// IdTab and answering exactly as it does. Longer ids go to the IdTab.
+struct ShortTab {
+    keys: Vec<u64>,
+    vl: Vec<u32>, // value << 4 | len
+    shift: u32,
+    mask: usize,
+}
+impl ShortTab {
+    fn new(ids: &[&[u8]], tab: &IdTab) -> ShortTab {
+        let n = (ids.len() * 8).next_power_of_two().max(64);
+        let mut t = ShortTab { keys: vec![0; n], vl: vec![0; n], shift: 64 - n.trailing_zeros(), mask: n - 1 };
+        for id in ids {
+            let len = id.len();
+            if len == 0 || len > 8 {
+                continue;
+            }
+            let mut b = [0u8; 16];
+            b[..len].copy_from_slice(id);
+            let v = match unsafe { tab.get(b.as_ptr(), len) } {
+                Some(v) => v,
+                None => continue,
+            };
+            let k = u64::from_le_bytes(b[..8].try_into().unwrap());
+            if k == 0 || v >= (1 << 27) {
+                continue;
+            }
+            let mut i = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> t.shift) as usize;
+            loop {
+                if t.keys[i] == 0 {
+                    t.keys[i] = k;
+                    t.vl[i] = (v << 4) | len as u32;
+                    break;
+                }
+                if t.keys[i] == k && (t.vl[i] & 15) as usize == len {
+                    break;
+                }
+                i = (i + 1) & t.mask;
+            }
+        }
+        t
+    }
+    /// value of the id at p (16 readable bytes past p + len)
+    #[inline(always)]
+    unsafe fn get(&self, p: *const u8, len: usize, tab: &IdTab) -> Option<u32> {
+        if len.wrapping_sub(1) >= 8 {
+            return tab.get(p, len);
+        }
+        let k = _bzhi_u64(rd64(p), (len * 8) as u32);
+        if k == 0 {
+            return tab.get(p, len);
+        }
+        let mut i = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize;
+        loop {
+            let kk = *self.keys.get_unchecked(i);
+            if kk == k {
+                let v = *self.vl.get_unchecked(i);
+                if (v & 15) as usize == len {
+                    return Some(v >> 4);
+                }
+            } else if kk == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
 /// Stage 1, event lines starting in [s, cb) (file end fe): parse, validate, stage records by event_id
 /// partition. A function of its own, so that its loop gets the registers to itself.
 struct EvCtx<'a> {
@@ -1582,6 +1652,7 @@ unsafe fn ev_lines<const STRICT: bool>(cx: &EvCtx, wc1: &mut Wc<Rec, WC1K>, evb:
 /// map to the person (CRING clicks after the link-table prefetch) and stage by person partition.
 struct CkCtx<'a> {
     camp_tab: &'a IdTab,
+    camp_short: &'a ShortTab,
     lm: &'a LinkMap,
     base_ms: i64,
     we: i64,
@@ -1590,7 +1661,7 @@ struct CkCtx<'a> {
 }
 #[inline(never)]
 unsafe fn ck_lines<const STRICT: bool>(cx: &CkCtx, wcc2: &mut Wc<RecC, 8>, c2: &mut [Vec<RecC>], cring: &mut [RecC; CRING], crn: &mut usize, mut s: usize, cb: usize, fe: usize) {
-    let CkCtx { camp_tab, lm, base_ms, we, q, .. } = *cx;
+    let CkCtx { camp_tab, camp_short, lm, base_ms, we, q, .. } = *cx;
     let strict = STRICT;
     let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
     while s < cb {
@@ -1619,7 +1690,7 @@ unsafe fn ck_lines<const STRICT: bool>(cx: &CkCtx, wcc2: &mut Wc<RecC, 8>, c2: &
         if t < base_ms || t >= we {
             continue;
         }
-        let camp = match camp_tab.get(p.add(f2), l2) {
+        let camp = match if CAMPS { camp_short.get(p.add(f2), l2, camp_tab) } else { camp_tab.get(p.add(f2), l2) } {
             Some(c) => c,
             None => continue,
         };
@@ -2002,6 +2073,8 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
     ginfo.clear();
     gperson.clear();
     {
+        let (gp, vp) = (gids.as_mut_ptr(), vals.as_mut_ptr());
+        let mut m = 0usize;
         for &(bp, blen) in es.iter() {
         let rs = std::slice::from_raw_parts(bp, blen);
         for (ri, r) in rs.iter().enumerate() {
@@ -2024,28 +2097,31 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
                     eoff.push(0);
                     ginfo.push(r.pos);
                     gperson.push(k);
+                    if eoff.len() * 2 > cap {
+                        // grow
+                        cap *= 4;
+                        gt.reset(cap);
+                        for (gi, &pk) in gperson.iter().enumerate() {
+                            let mut idx = pk as usize & gt.mask;
+                            while gt.keys[idx] != 0 {
+                                idx = (idx + 1) & gt.mask;
+                            }
+                            gt.keys[idx] = pk;
+                            gt.vals[idx] = gi as u32;
+                        }
+                    }
                     break g;
                 }
                 idx = (idx + 1) & gt.mask;
             };
             *eoff.get_unchecked_mut(g as usize) += 1;
-            gids.push(g);
-            vals.push(((r.ts as u64) << 32) | r.pc as u64);
-            if eoff.len() * 2 > cap {
-                // grow
-                cap *= 4;
-                gt.reset(cap);
-                for (gi, &pk) in gperson.iter().enumerate() {
-                    let mut idx = pk as usize & gt.mask;
-                    while gt.keys[idx] != 0 {
-                        idx = (idx + 1) & gt.mask;
-                    }
-                    gt.keys[idx] = pk;
-                    gt.vals[idx] = gi as u32;
-                }
-            }
+            *gp.add(m) = g;
+            *vp.add(m) = ((r.ts as u64) << 32) | r.pc as u64;
+            m += 1;
         }
         }
+        gids.set_len(m);
+        vals.set_len(m);
     }
     let ng = eoff.len();
     // prefix sums (eoff[g] = start)
@@ -3446,6 +3522,7 @@ fn main() {
     let build_prods = Sh::new(Some(build_prods));
     let cids: Vec<&[u8]> = (0..camps.rows.len()).map(|r| camps.a(r)).collect();
     let camp_tab = IdTab::new(&cids, &(0..camps.rows.len() as u32).collect::<Vec<u32>>());
+    let camp_short = ShortTab::new(&cids, &camp_tab);
     let ncamp = camps.rows.len();
     assert!(ncamp < 65535, "too many campaigns");
 
@@ -3551,7 +3628,7 @@ fn main() {
             let (next_chunk, next_p1, next_q, barrier) = (&next_chunk, &next_p1, &next_q, &barrier);
             let links_ready = &links_ready;
             let (lchunks, next_lchunk, lraw) = (&lchunks, &next_lchunk, &lraw);
-            let (camp_tab, ln_segs, out_dir) = (&camp_tab, &ln_segs, &out_dir);
+            let (camp_tab, camp_short, ln_segs, out_dir) = (&camp_tab, &camp_short, &ln_segs, &out_dir);
             let (dims, build_prods) = (&dims, &build_prods);
             let cpus = &cpus;
             let body = move || unsafe {
@@ -3935,7 +4012,7 @@ fn main() {
                                     l
                                 }
                             };
-                            let cx = CkCtx { camp_tab, lm: l, base_ms, we, q, strict };
+                            let cx = CkCtx { camp_tab, camp_short, lm: l, base_ms, we, q, strict };
                             if strict {
                                 ck_lines::<true>(&cx, &mut wcc2, c2, &mut cring, &mut crn, s, c.b, c.fe);
                             } else {
