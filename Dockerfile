@@ -1,13 +1,16 @@
-# Shopping Sessions: one static Rust binary in an empty image (nothing else to set up at container start).
 FROM rust:1.91-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml ./
 COPY .cargo .cargo
 COPY src src
-RUN RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static" cargo build --release --bin pipeline --target x86_64-unknown-linux-gnu \
- && strip target/x86_64-unknown-linux-gnu/release/pipeline
+RUN cargo build --release && cd target/release && strip va vb vc vd ve
+COPY bench/generator /gen
+RUN cd /gen && cargo build --release && strip target/release/generate
 
-FROM scratch
-COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/pipeline /pipeline
+FROM debian:bookworm-slim
+COPY --from=build /src/target/release/va /src/target/release/vb /src/target/release/vc /src/target/release/vd /src/target/release/ve /app/
+COPY --from=build /gen/target/release/generate /app/generate
+COPY bench/ab2.sh /app/ab2.sh
 USER 1000:1000
-CMD ["/pipeline"]
+ENV BENCH_EVENTS=60000000 REPS=2 VARIANTS="a:va b:va:SS_P1=2048 c:va:SS_Q=2048 d:va:SS_P1=2048:SS_Q=2048 e:va:SS_Q=4096 f:va:SS_P1=2048:SS_Q=4096 g:va:SS_P1=512 h:va"
+CMD ["/bin/sh", "/app/ab2.sh"]
