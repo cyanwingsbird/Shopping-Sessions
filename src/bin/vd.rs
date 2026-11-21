@@ -827,6 +827,8 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     k
 }
 const SCAN: usize = 1 << 16;
+/// stage 3: radix-sort each partition by ts instead of sorting each person's events
+const RADIX3: bool = true;
 
 #[derive(Default, Clone, Copy)]
 struct Sp7 {
@@ -1187,7 +1189,8 @@ struct LBucket {
 }
 const LB0: LBucket = LBucket { keys: [0; 4], persons: [0; 4] };
 struct LinkMap {
-    mask: usize, // bucket mask
+    mask: usize, // nonzero iff there are links
+    nb: usize,   // buckets; bucket of key k = (low 32 bits of k) * nb >> 32
     slots: Vec<LBucket>,
     ovf: Vec<u64>, // per bucket: did an insert spill past it
     names: Vec<LSlot>,
@@ -1197,8 +1200,12 @@ impl LinkMap {
     /// (person hash, linked) for user hash k; an unlinked user is its own person. Branch-free
     /// unless k's home bucket overflowed.
     #[inline(always)]
+    fn bucket(&self, k: u64) -> usize {
+        ((k as u32 as u64 * self.nb as u64) >> 32) as usize
+    }
+    #[inline(always)]
     unsafe fn map(&self, k: u64) -> (u64, bool) {
-        let i = k as usize & self.mask;
+        let i = self.bucket(k);
         let b = self.slots.get_unchecked(i);
         let keys = _mm256_load_si256(b.keys.as_ptr() as *const __m256i);
         let eq = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(k as i64)))) as u32;
@@ -1213,7 +1220,7 @@ impl LinkMap {
     #[cold]
     #[inline(never)]
     unsafe fn map_slow(&self, k: u64) -> (u64, bool) {
-        let mut i = k as usize & self.mask;
+        let mut i = self.bucket(k);
         loop {
             let b = self.slots.get_unchecked(i);
             for j in 0..4 {
@@ -1224,7 +1231,7 @@ impl LinkMap {
                     return (k, false);
                 }
             }
-            i = (i + 1) & self.mask;
+            i = if i + 1 == self.nb { 0 } else { i + 1 };
         }
     }
     unsafe fn name(&self, k: u64) -> u64 {
@@ -1239,7 +1246,7 @@ impl LinkMap {
     }
     #[inline(always)]
     unsafe fn prefetch(&self, k: u64) {
-        _mm_prefetch(self.slots.as_ptr().add(k as usize & self.mask) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(self.slots.as_ptr().add(self.bucket(k)) as *const i8, _MM_HINT_T0);
     }
 }
 unsafe fn name_bytes<'a>(loc: u64) -> &'a [u8] {
@@ -1259,7 +1266,7 @@ unsafe fn prefix_of(loc: u64) -> u64 {
 }
 unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
     if raw.is_empty() {
-        return LinkMap { mask: 0, slots: vec![LB0], ovf: vec![0], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 };
+        return LinkMap { mask: 0, nb: 1, slots: vec![LB0], ovf: vec![0], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 };
     }
     let cap = (raw.len() * 4).next_power_of_two().max(16);
     let mask = cap - 1;
@@ -1334,9 +1341,11 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
             minid[r] = i as u32;
         }
     }
-    // final table: id hash -> person hash, 4-slot buckets, load factor <= 0.75
-    let fcap = n.div_ceil(3).next_power_of_two().max(4);
-    let fmask = fcap - 1;
+    // final table: id hash -> person hash, 4-slot buckets, load factor <= 0.75. Only ids that are not
+    // their person's name: a person's smallest id maps to itself, which is also what a miss returns.
+    let nn = (0..n).filter(|&i| minid[parent[i] as usize] as usize != i).count();
+    let fcap = nn * 10 / 24 + 1; // load 0.6
+    let fb = |h: u64| ((h as u32 as u64 * fcap as u64) >> 32) as usize;
     let mut fin = vec![LB0; fcap];
     let mut ovf = vec![0u64; fcap.div_ceil(64)];
     let mut nroots = 0usize;
@@ -1351,9 +1360,12 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
     for i in 0..n {
         let m = minid[parent[i] as usize] as usize;
         let h = hashes[i];
-        let home = h as usize & fmask;
+        let home = fb(h);
         let mut j = home;
         'ins: loop {
+            if m == i {
+                break;
+            }
             for t in 0..4 {
                 if fin[j].keys[t] == 0 {
                     fin[j].keys[t] = h;
@@ -1362,7 +1374,7 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
                 }
             }
             ovf[home >> 6] |= 1 << (home & 63);
-            j = (j + 1) & fmask;
+            j = if j + 1 == fcap { 0 } else { j + 1 };
         }
         if parent[i] as usize == i {
             let ph = hashes[m];
@@ -1376,9 +1388,9 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
     drop(slots);
     if std::env::var_os("SS_LMSTAT").is_some() {
         let no: u32 = ovf.iter().map(|w| w.count_ones()).sum();
-        eprintln!("linkmap: n {} buckets {} load {:.2} overflowed {}", n, fcap, n as f64 / (4 * fcap) as f64, no);
+        eprintln!("linkmap: n {} stored {} buckets {} load {:.2} overflowed {}", n, nn, fcap, nn as f64 / (4 * fcap) as f64, no);
     }
-    LinkMap { mask: fmask, slots: fin, ovf, names, nmask }
+    LinkMap { mask: 1, nb: fcap, slots: fin, ovf, names, nmask }
 }
 
 // ---------------------------------------------------------------- parquet
@@ -1795,6 +1807,63 @@ fn tsc() -> u64 {
     unsafe { _rdtsc() }
 }
 
+// ---- optional hardware counters (SS_PERF=1): cycles, instructions, branch misses, LLC misses per stage
+extern "C" {
+    fn syscall(n: i64, ...) -> i64;
+    fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
+    fn __errno_location() -> *mut i32;
+}
+/// [stage][counter], summed over threads
+static PERF: [[std::sync::atomic::AtomicU64; 4]; 3] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 3];
+static PERF_ERR: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+struct Perf {
+    fds: [i32; 4],
+    last: [u64; 4],
+}
+impl Perf {
+    fn open(on: bool) -> Perf {
+        let mut p = Perf { fds: [-1; 4], last: [0; 4] };
+        if !on {
+            return p;
+        }
+        for (i, cfg) in [0u64, 1, 5, 3].iter().enumerate() {
+            let mut attr = [0u64; 16];
+            attr[0] = (128u64) << 32; // type 0 (hardware), size 128
+            attr[1] = *cfg;
+            attr[5] = (1 << 5) | (1 << 6); // exclude_kernel, exclude_hv
+            let fd = unsafe { syscall(298, attr.as_ptr(), 0i32, -1i32, -1i32, 0u64) };
+            if fd < 0 {
+                PERF_ERR.store(unsafe { *__errno_location() } as i64 + 1000 * (i as i64 + 1), Relaxed);
+            }
+            p.fds[i] = fd as i32;
+        }
+        p.mark();
+        p
+    }
+    fn now(&self) -> [u64; 4] {
+        let mut v = [0u64; 4];
+        for i in 0..4 {
+            if self.fds[i] >= 0 {
+                unsafe { read(self.fds[i], &mut v[i] as *mut u64 as *mut u8, 8) };
+            }
+        }
+        v
+    }
+    fn mark(&mut self) {
+        self.last = self.now();
+    }
+    fn stage(&mut self, st: usize) {
+        if self.fds[0] < 0 && self.fds[1] < 0 {
+            return;
+        }
+        let v = self.now();
+        for i in 0..4 {
+            PERF[st][i].fetch_add(v[i].wrapping_sub(self.last[i]), Relaxed);
+        }
+        self.last = v;
+    }
+}
+
 extern "C" {
     fn execv(path: *const i8, argv: *const *const i8) -> i32;
 }
@@ -1890,6 +1959,7 @@ fn main() {
     let prefault = std::env::var("SS_PREFAULT").is_ok();
     let click_dedup = std::env::var("SS_CLICK_DEDUP").is_ok();
     let strict = std::env::var("SS_STRICT").is_ok();
+    let perf_on = true;
     let abl: usize = std::env::var("SS_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(99);
     let envn = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
     let nthreads = envn("SS_THREADS")
@@ -2024,7 +2094,7 @@ fn main() {
     let ck2: Vec<Sh<Vec<Vec<RecC>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let cells: Vec<Sh<Vec<Cell>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let assists: Vec<Sh<Vec<u32>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
-    let linkmap: Sh<LinkMap> = Sh::new(LinkMap { mask: 0, slots: vec![LB0], ovf: vec![0], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 });
+    let linkmap: Sh<LinkMap> = Sh::new(LinkMap { mask: 0, nb: 1, slots: vec![LB0], ovf: vec![0], names: vec![LSlot { key: 0, person: 0 }], nmask: 0 });
     let next_chunk = AtomicUsize::new(0);
     let next_p1 = AtomicUsize::new(0);
     let next_q = AtomicUsize::new(0);
@@ -2041,6 +2111,7 @@ fn main() {
             let (next_chunk, next_p1, next_q, barrier) = (&next_chunk, &next_p1, &next_q, &barrier);
             let (prod_tab, camp_tab, ln_segs, cat_names, cat_rank, out_dir) = (&prod_tab, &camp_tab, &ln_segs, &cat_names, &cat_rank, &out_dir);
             let body = move || unsafe {
+                let mut perf = Perf::open(perf_on);
                 // ================= links (thread 0)
                 if tid == 0 {
                     let mut raw: Vec<LinkRaw> = Vec::new();
@@ -2067,7 +2138,11 @@ fn main() {
                             s += len + 1;
                         }
                     }
+                    let tl = t0.elapsed();
                     *linkmap.get() = build_links(&raw);
+                    if timing {
+                        eprintln!("links parsed {:?}", tl);
+                    }
                     if timing {
                         let lmr = &*linkmap.get();
                         eprintln!("links done {:?} ({} links, table {} MB, names {} MB)", t0.elapsed(), raw.len(), lmr.slots.len() * 64 >> 20, lmr.names.len() * 16 >> 20);
@@ -2275,6 +2350,7 @@ fn main() {
                 }
                 wc1.finish(evb);
                 wcc1.finish(ckb);
+                perf.stage(0);
                 barrier.wait();
                 if timing && tid == 0 {
                     eprintln!("stage1 done {:?} {}", t0.elapsed(), abl_sink);
@@ -2288,7 +2364,7 @@ fn main() {
                 *c2 = (0..q).map(|_| Vec::with_capacity(est_ck / (q * nthreads) * 5 / 4 + 64)).collect();
                 let mut table: Vec<u64> = Vec::new();
                 let mut table32: Vec<u32> = Vec::new();
-                let mut wc2: Wc<Rec2, 4> = Wc::new(q);
+                let mut wc2: Wc<Rec2, 8> = Wc::new(q);
                 let mut ph = [0u64; 8];
                 let mut wcc2: Wc<RecC, 8> = Wc::new(q);
                 loop {
@@ -2509,6 +2585,7 @@ fn main() {
                 }
                 wc2.finish(e2);
                 wcc2.finish(c2);
+                perf.stage(1);
                 barrier.wait();
                 if timing && tid == 0 {
                     eprintln!("stage2 done {:?} {}", t0.elapsed(), abl_sink);
@@ -2522,6 +2599,8 @@ fn main() {
                 let mut gt = GTable { keys: Vec::new(), vals: Vec::new(), mask: 0 };
                 let mut gids: Vec<u32> = Vec::new();
                 let mut rtmp: Vec<u64> = Vec::new();
+                let mut rv2: Vec<u64> = Vec::new();
+                let mut rg2: Vec<u32> = Vec::new();
                 let mut vals: Vec<u64> = Vec::new();
                 let mut cgids: Vec<u32> = Vec::new();
                 let mut ctmp: Vec<(u32, u32, u64)> = Vec::new();
@@ -2611,6 +2690,42 @@ fn main() {
                         acc += c;
                     }
                     eoff.push(acc);
+                    if RADIX3 {
+                        // order the partition by ts first (LSD radix, 3 x 11 bits, stable), so that the
+                        // stable placement by person below leaves every person's events sorted by ts
+                        rv2.clear();
+                        rv2.resize(n, 0);
+                        rg2.clear();
+                        rg2.resize(n, 0);
+                        let (mut sv, mut sg) = (vals.as_mut_ptr(), gids.as_mut_ptr());
+                        let (mut dv, mut dg) = (rv2.as_mut_ptr(), rg2.as_mut_ptr());
+                        for pass in 0..3u32 {
+                            let shift = 32 + 11 * pass;
+                            let mut cnt = [0u32; 2048];
+                            for i in 0..n {
+                                *cnt.get_unchecked_mut(((*sv.add(i) >> shift) & 2047) as usize) += 1;
+                            }
+                            let mut a = 0u32;
+                            for c in cnt.iter_mut() {
+                                let x = *c;
+                                *c = a;
+                                a += x;
+                            }
+                            for i in 0..n {
+                                let v = *sv.add(i);
+                                let d = ((v >> shift) & 2047) as usize;
+                                let o = *cnt.get_unchecked(d) as usize;
+                                *cnt.get_unchecked_mut(d) = o as u32 + 1;
+                                *dv.add(o) = v;
+                                *dg.add(o) = *sg.add(i);
+                            }
+                            std::mem::swap(&mut sv, &mut dv);
+                            std::mem::swap(&mut sg, &mut dg);
+                        }
+                        // three passes: the sorted data is in rv2/rg2
+                        std::mem::swap(&mut vals, &mut rv2);
+                        std::mem::swap(&mut gids, &mut rg2);
+                    }
                     evs.clear();
                     evs.resize(n, 0);
                     for i in 0..n {
@@ -2679,7 +2794,8 @@ fn main() {
                     // per person
                     for g in 0..ng {
                         let ev = &mut evs[eoff[g] as usize..eoff[g + 1] as usize];
-                        if ev.len() > 1024 {
+                        if RADIX3 {
+                        } else if ev.len() > 1024 {
                             // big persons (whales, shared devices): stable LSD radix sort on ts
                             // (events with equal ts may come in any order without changing results)
                             radix_ts(ev, &mut rtmp);
@@ -2825,6 +2941,7 @@ fn main() {
                     }
                     ph[5] += tsc() - t3c;
                 }
+                perf.stage(2);
                 for (i, v) in ph.iter().enumerate() {
                     PHASE[i].fetch_add(*v, Relaxed);
                 }
@@ -2957,6 +3074,14 @@ fn main() {
             line.push_str(&format!(" {}={}", n, PHASE[i].load(Relaxed) / 1_000_000));
         }
         eprintln!("{line}");
+        if perf_on {
+            let mut l = format!("perf(err {})", PERF_ERR.load(Relaxed));
+            for st in 0..3 {
+                let v: Vec<u64> = (0..4).map(|i| PERF[st][i].load(Relaxed) / 1_000_000).collect();
+                l.push_str(&format!(" s{}:cyc{},ins{},bm{},llc{}", st + 1, v[0], v[1], v[2], v[3]));
+            }
+            eprintln!("{l}");
+        }
         let mut ru = [0i64; 18];
         unsafe { getrusage(0, &mut ru) };
         eprintln!(
