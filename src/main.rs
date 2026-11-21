@@ -1008,6 +1008,8 @@ const RELEASE: bool = true;
 const NAMECP: bool = true;
 /// stage 1: ISO ts with an offset parsed with ingest_ts in the same SIMD pass as the Z form
 const ISOM: bool = true;
+/// stage-2 lookups: each record's bucket found once (at its prefetch) and kept in a ring
+const BPRING: bool = true;
 /// input page tables dropped in 32 MB pieces by threads done writing, once stage 3 is over everywhere
 const RELEASE2: bool = true;
 /// stage-3 assists: day block of each session kept, pdays ends with a sentinel
@@ -1969,6 +1971,34 @@ unsafe fn s2_part(slices: &[(*mut Rec, usize)], bufs: &mut S2Buf, lm: &LinkMap, 
         // buffers only): the two working sets do not compete for the cache
         for s in slices.iter() {
             let recs = std::slice::from_raw_parts_mut(s.0, s.1);
+            if BPRING {
+                // the bucket each record's lookup uses is found once, PF2 records ahead (where its
+                // line is prefetched), and kept in a ring until the lookup
+                let mut ring = [(std::ptr::null::<LBucket>(), 0u64); 32];
+                let n = recs.len();
+                for j in 0..PF2.min(n) {
+                    let (bp, bit, bi) = lm.bucket_ptr(recs.get_unchecked(j).user);
+                    ring[j & 31] = (bp, ((bi as u64) << 1) | bit);
+                }
+                for i in 0..n {
+                    if i + 2 * PF2 < n {
+                        let k = recs.get_unchecked(i + 2 * PF2).user;
+                        let fi = (k >> 32) as usize & lm.fmask;
+                        _mm_prefetch(lm.filt.as_ptr().add(fi >> 6) as *const i8, _MM_HINT_T0);
+                    }
+                    if i + PF2 < n {
+                        let (bp, bit, bi) = lm.bucket_ptr(recs.get_unchecked(i + PF2).user);
+                        _mm_prefetch(bp as *const i8, _MM_HINT_T0);
+                        *ring.get_unchecked_mut((i + PF2) & 31) = (bp, ((bi as u64) << 1) | bit);
+                    }
+                    let (bp, ib) = *ring.get_unchecked(i & 31);
+                    let r = recs.get_unchecked_mut(i);
+                    let (pu, linked) = lm.map_at(r.user, bp, ib & 1, (ib >> 1) as usize);
+                    r.eh = pu;
+                    r.user = linked as u64;
+                }
+                continue;
+            }
             for i in 0..recs.len() {
                 // filter word 2*PF2 records ahead, the table line PF2 ahead
                 if i + 2 * PF2 < recs.len() {
@@ -2753,6 +2783,11 @@ impl LinkMap {
     #[inline(always)]
     unsafe fn map(&self, k: u64) -> (u64, bool) {
         let (bp, bit, i) = self.bucket_ptr(k);
+        self.map_at(k, bp, bit, i)
+    }
+    /// map with the bucket already found (bucket_ptr)
+    #[inline(always)]
+    unsafe fn map_at(&self, k: u64, bp: *const LBucket, bit: u64, i: usize) -> (u64, bool) {
         let b = &*bp;
         let keys = _mm256_load_si256(b.keys.as_ptr() as *const __m256i);
         let eq = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(k as i64)))) as u32;
@@ -5250,7 +5285,8 @@ fn main() {
                     // all) once every thread is past stage 3; threads that are done writing take 32 MB
                     // pieces while the last ones still write
                     while s3_done.load(std::sync::atomic::Ordering::Acquire) < nthreads {
-                        std::hint::spin_loop();
+                        // sleep, not spin: the sibling hyperthread may be the one still in stage 3
+                        std::thread::sleep(std::time::Duration::from_micros(20));
                     }
                     const PIECE: usize = 32 << 20;
                     loop {
