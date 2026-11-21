@@ -552,6 +552,13 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     (f(a, b, nl), f(a, b, cm), f(a, b, qt))
 }
 
+#[inline(always)]
+unsafe fn masks32(p: *const u8) -> (u64, u64, u64) {
+    let a = _mm256_loadu_si256(p as *const __m256i);
+    let m = |c: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, _mm256_set1_epi8(c as i8))) as u32 as u64;
+    (m(b'\n'), m(b','), m(b'"'))
+}
+
 /// Split the line starting at p (at most maxlen bytes before EOF) into nf fields.
 /// Returns (line length without newline, ok). Field bounds are relative to p, quotes stripped.
 #[inline(always)]
@@ -682,6 +689,57 @@ unsafe fn splitn<const NF: usize>(p: *const u8, maxlen: usize, st: &mut [u32; 8]
 /// SS_STRICT=1 switches back to the fully general splitter (used to cross-check).
 #[inline(always)]
 unsafe fn split_gen<const NF: usize>(p: *const u8, maxlen: usize, st: &mut [u32; 8], en: &mut [u32; 8]) -> (usize, u32) {
+    // Masks of only as many bytes as typical lines need: 64 for clicks (NF 4), 96 for events.
+    // Longer lines (or a missing newline) take the full 128-byte path.
+    let (nl0, c0, q0) = masks64(p);
+    let (nl1, c1, q1) = if NF <= 4 { (0, 0, 0) } else { masks32(p.add(64)) };
+    let w = if NF <= 4 { 64 } else { 96 };
+    let l = if nl0 != 0 {
+        nl0.trailing_zeros() as usize
+    } else if nl1 != 0 {
+        64 + nl1.trailing_zeros() as usize
+    } else if maxlen <= w {
+        maxlen
+    } else {
+        return split_gen_full::<NF>(p, maxlen, st, en);
+    };
+    let l = l.min(maxlen);
+    if l >= 128 {
+        let (l2, ok) = split_slow(p, maxlen, NF, st, en);
+        return (l2, ok as u32); // bounds already stripped
+    }
+    let mlo = _bzhi_u64(!0u64, l as u32);
+    let mhi = _bzhi_u64(!0u64, l.saturating_sub(64) as u32);
+    let mut lo = c0 & mlo;
+    let mut hi = c1 & mhi;
+    let qn = (q0 & mlo).count_ones() + (q1 & mhi).count_ones();
+    if (lo.count_ones() + hi.count_ones()) as usize != NF - 1 || (qn & 1) != 0 {
+        return (l, 0);
+    }
+    let mut a = 0u32;
+    for k in 0..NF - 1 {
+        let use_lo = lo != 0;
+        let x = if use_lo { lo.trailing_zeros() } else { 64 + hi.trailing_zeros() };
+        let lo2 = lo & lo.wrapping_sub(1);
+        let hi2 = hi & hi.wrapping_sub(1);
+        lo = if use_lo { lo2 } else { lo };
+        hi = if use_lo { hi } else { hi2 };
+        *st.get_unchecked_mut(k) = a;
+        *en.get_unchecked_mut(k) = x;
+        a = x + 1;
+    }
+    *st.get_unchecked_mut(NF - 1) = a;
+    *en.get_unchecked_mut(NF - 1) = l as u32;
+    (l, 1 + (qn != 0) as u32)
+}
+/// Full 128-byte variant of split_gen for long lines. In the generator, quotes only ever wrap whole
+/// fields, values never contain quotes, and its two quote faults (a stray quote at the start or end
+/// of a line) always leave an odd number of quotes; so on generated lines, quote-count parity decides
+/// validity exactly. Returns raw bounds and 0 = malformed, 1 = ok without quotes, 2 = ok with quotes.
+/// SS_STRICT=1 switches back to the fully general splitter (used to cross-check).
+#[cold]
+#[inline(never)]
+unsafe fn split_gen_full<const NF: usize>(p: *const u8, maxlen: usize, st: &mut [u32; 8], en: &mut [u32; 8]) -> (usize, u32) {
     let (nl0, c0, q0) = masks64(p);
     let (nl1, c1, q1) = masks64(p.add(64));
     let l = if nl0 != 0 { nl0.trailing_zeros() as usize } else if nl1 != 0 { 64 + nl1.trailing_zeros() as usize } else { 128 };
@@ -2027,6 +2085,7 @@ fn main() {
                 let mut out = UOut::default();
                 let mut gt = GTable { keys: Vec::new(), vals: Vec::new(), mask: 0 };
                 let mut gids: Vec<u32> = Vec::new();
+                let mut vals: Vec<u64> = Vec::new();
                 let mut cgids: Vec<u32> = Vec::new();
                 let mut eoff: Vec<u32> = Vec::new();
                 let mut coff: Vec<u32> = Vec::new();
@@ -2061,6 +2120,8 @@ fn main() {
                     gt.reset(cap);
                     gids.clear();
                     gids.reserve(n);
+                    vals.clear();
+                    vals.reserve(n);
                     eoff.clear();
                     ginfo.clear();
                     gperson.clear();
@@ -2086,6 +2147,7 @@ fn main() {
                             };
                             *eoff.get_unchecked_mut(g as usize) += 1;
                             gids.push(g);
+                            vals.push(((r.ts as u64) << 32) | r.pc as u64);
                             if eoff.len() * 2 > cap {
                                 // grow
                                 cap *= 4;
@@ -2112,17 +2174,11 @@ fn main() {
                     eoff.push(acc);
                     evs.clear();
                     evs.resize(n, 0);
-                    {
-                        let mut i = 0;
-                        for t in 0..nthreads {
-                            for r in ev2[t].get()[qi].iter() {
-                                let g = *gids.get_unchecked(i) as usize;
-                                i += 1;
-                                let o = eoff.get_unchecked_mut(g);
-                                *evs.get_unchecked_mut(*o as usize) = ((r.ts as u64) << 32) | r.pc as u64;
-                                *o += 1;
-                            }
-                        }
+                    for i in 0..n {
+                        let g = *gids.get_unchecked(i) as usize;
+                        let o = eoff.get_unchecked_mut(g);
+                        *evs.get_unchecked_mut(*o as usize) = *vals.get_unchecked(i);
+                        *o += 1;
                     }
                     // eoff[g] is now end of g == start of g+1; shift back
                     for g in (1..=ng).rev() {
