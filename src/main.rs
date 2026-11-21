@@ -1388,6 +1388,7 @@ fn main() {
     }
     let timing = std::env::var("SS_TIMING").is_ok();
     let prefault = std::env::var("SS_NOPREFAULT").is_err();
+    let click_dedup = std::env::var("SS_CLICK_DEDUP").is_ok();
     let abl: usize = std::env::var("SS_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(99);
     let envn = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
     let nthreads = envn("SS_THREADS")
@@ -1792,8 +1793,14 @@ fn main() {
                             }
                             unreachable!()
                         };
+                        // Copies of a click have identical values (rules.md), so a duplicate can change neither
+                        // the crediting click (same ts and click_id) nor the set of assisting campaigns:
+                        // click dedup is skipped unless SS_CLICK_DEDUP is set (kept for verification).
                         let mut gi = 0usize;
                         for s in &slices {
+                            if !click_dedup {
+                                break;
+                            }
                             for i in 0..s.1 {
                                 let r = &mut *s.0.add(i);
                                 let kh = r.kh & 0xFFFF_FFFF;
