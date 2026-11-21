@@ -828,9 +828,10 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
 }
 const SCAN: usize = 1 << 16;
 /// stage 3: radix-sort each partition by ts instead of sorting each person's events
-const RADIX3: bool = false;
-/// diagnostic: time the sorts and the name fetch inside stage 3's per-person loop
-const PHASE_FINE: bool = true;
+const RADIX3: bool = true;
+const HIST: bool = false;
+static SIZEH: [std::sync::atomic::AtomicU64; 32] = [const { std::sync::atomic::AtomicU64::new(0) }; 32];
+static SIZEE: [std::sync::atomic::AtomicU64; 32] = [const { std::sync::atomic::AtomicU64::new(0) }; 32];
 
 #[derive(Default, Clone, Copy)]
 struct Sp7 {
@@ -1245,10 +1246,6 @@ impl LinkMap {
             }
             i = (i + 1) & self.nmask;
         }
-    }
-    #[inline(always)]
-    unsafe fn prefetch_name(&self, k: u64) {
-        _mm_prefetch(self.names.as_ptr().add(k as usize & self.nmask) as *const i8, _MM_HINT_T0);
     }
     #[inline(always)]
     unsafe fn prefetch(&self, k: u64) {
@@ -1965,9 +1962,10 @@ fn main() {
     let prefault = std::env::var("SS_PREFAULT").is_ok();
     let click_dedup = std::env::var("SS_CLICK_DEDUP").is_ok();
     let strict = std::env::var("SS_STRICT").is_ok();
-    let perf_on = true;
+    let perf_on = std::env::var("SS_PERF").is_ok();
     let abl: usize = std::env::var("SS_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(99);
     let envn = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+    let repeat = envn("SS_REPEAT").unwrap_or(1);
     let nthreads = envn("SS_THREADS")
         .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
         .or(envn("NCPU"))
@@ -2089,7 +2087,7 @@ fn main() {
     let est_ev = ev_bytes / 72 + 1;
     let est_ck = ck_bytes / 44 + 1;
     let pow2 = |x: usize, lo: usize, hi: usize| x.next_power_of_two().clamp(lo, hi);
-    let p1 = envn("SS_P1").unwrap_or_else(|| pow2(est_ev / 32768, 1, 1024));
+    let p1 = envn("SS_P1").unwrap_or_else(|| pow2(est_ev / 65536, 1, 512));
     let p1c = envn("SS_P1C").unwrap_or_else(|| pow2(est_ck / 65536, 1, 128));
     let q = envn("SS_Q").unwrap_or_else(|| pow2(est_ev / 32768, 1, 1024));
 
@@ -2097,9 +2095,6 @@ fn main() {
     let ev1: Vec<Sh<Vec<Vec<Rec>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let ck1: Vec<Sh<Vec<Vec<RecC>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let ev2: Vec<Sh<Vec<Vec<Rec2>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
-    // tombstones: an emitted event that a later-read copy with a smaller ingest_ts displaced (stage 3
-    // removes one event with the same person, ts, price and category)
-    let tomb: Vec<Sh<Vec<Vec<Rec2>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let ck2: Vec<Sh<Vec<Vec<RecC>>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let cells: Vec<Sh<Vec<Cell>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let assists: Vec<Sh<Vec<u32>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
@@ -2117,7 +2112,6 @@ fn main() {
     std::thread::scope(|sc| {
         for tid in 0..nthreads {
             let (chunks, ev1, ck1, ev2, ck2, cells, linkmap, assists) = (&chunks, &ev1, &ck1, &ev2, &ck2, &cells, &linkmap, &assists);
-            let tomb = &tomb;
             let (next_chunk, next_p1, next_q, barrier) = (&next_chunk, &next_p1, &next_q, &barrier);
             let (prod_tab, camp_tab, ln_segs, cat_names, cat_rank, out_dir) = (&prod_tab, &camp_tab, &ln_segs, &cat_names, &cat_rank, &out_dir);
             let body = move || unsafe {
@@ -2168,9 +2162,22 @@ fn main() {
                 let mut wc1: Wc<Rec, 4> = Wc::new(p1);
                 let mut nlbuf: Vec<u32> = vec![0u32; SCAN + 64];
                 let mut wcc1: Wc<RecC, 8> = Wc::new(p1c);
+                // SS_REPEAT=n (single thread, parse benchmark): run the chunk loop n times, report each
+                let mut rep_left = repeat;
+                let mut rep_t = Instant::now();
                 loop {
                     let ci = next_chunk.fetch_add(1, Relaxed);
                     if ci >= chunks.len() {
+                        if rep_left > 1 {
+                            rep_left -= 1;
+                            eprintln!("repeat {:?}", rep_t.elapsed());
+                            rep_t = Instant::now();
+                            next_chunk.store(0, Relaxed);
+                            continue;
+                        }
+                        if repeat > 1 {
+                            eprintln!("repeat {:?}", rep_t.elapsed());
+                        }
                         break;
                     }
                     let c = chunks[ci];
@@ -2371,8 +2378,6 @@ fn main() {
                 let e2 = ev2[tid].get();
                 let c2 = ck2[tid].get();
                 *e2 = (0..q).map(|_| Vec::with_capacity(est_ev / (q * nthreads) * 5 / 4 + 64)).collect();
-                let t2 = tomb[tid].get();
-                *t2 = (0..q).map(|_| Vec::new()).collect();
                 *c2 = (0..q).map(|_| Vec::with_capacity(est_ck / (q * nthreads) * 5 / 4 + 64)).collect();
                 let mut table: Vec<u64> = Vec::new();
                 let mut table32: Vec<u32> = Vec::new();
@@ -2410,7 +2415,6 @@ fn main() {
                             unreachable!()
                         };
                         let mut gi = 0usize;
-                        let mut merged = false;
                         if n < (1 << 20) - 1 {
                             // compact table: 16-slot buckets (one 64-byte line) of 12-bit tag << 20 | record
                             // index + 1; a lookup compares the whole bucket at once (no data-dependent branches
@@ -2420,39 +2424,16 @@ fn main() {
                             table32.clear();
                             table32.resize(nb * 16 + 16, 0);
                             let tb = ((table32.as_mut_ptr() as usize + 63) & !63) as *mut u32;
-                            // one pass: dedup and emit together. A record is emitted when it is first seen (or
-                            // displaces the copy kept so far); a displaced, already emitted copy gets a tombstone.
-                            macro_rules! emit {
-                                ($r:expr, $tomb:expr) => {{
-                                    let r: &Rec = $r;
-                                    let mut o = Rec2 { user: r.user, pos: (r.pp >> 24) << 1, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
-                                    if has_links {
-                                        let (pu, linked) = lm.map(r.user);
-                                        o.user = pu;
-                                        o.pos |= linked as u64;
-                                    }
-                                    let part = (((o.user >> 32) * q as u64) >> 32) as usize;
-                                    if $tomb {
-                                        t2.get_unchecked_mut(part).push(o);
-                                    } else {
-                                        wc2.push(e2, part, o);
-                                    }
-                                }};
-                            }
                             for s in &slices {
                                 if abl == 6 {
                                     break;
                                 }
                                 for i in 0..s.1 {
-                                    if has_links && i + 24 < s.1 {
-                                        lm.prefetch((*s.0.add(i + 24)).user);
-                                    }
                                     let r = &mut *s.0.add(i);
                                     let tag = ((r.eh >> 32) & 0xFFF) as u32;
                                     let t = _mm256_set1_epi32(tag as i32);
                                     let z = _mm256_setzero_si256();
                                     let mut b = r.eh as usize & bmask;
-                                    let mut keep = true;
                                     'probe: loop {
                                         let p = tb.add(b * 16);
                                         let v0 = _mm256_load_si256(p as *const __m256i);
@@ -2470,14 +2451,10 @@ fn main() {
                                             let o = &mut *resolve(((e & 0xF_FFFF) - 1) as usize);
                                             if o.eh == r.eh {
                                                 if (r.ic >> 8) < (o.ic >> 8) {
-                                                    if o.ts < 0x8000_0000 {
-                                                        emit!(o, true);
-                                                    }
                                                     o.ts = DEAD;
                                                     *p.add(j) = (tag << 20) | (gi as u32 + 1);
                                                 } else {
                                                     r.ts = DEAD;
-                                                    keep = false;
                                                 }
                                                 break 'probe;
                                             }
@@ -2488,13 +2465,9 @@ fn main() {
                                         }
                                         b = (b + 1) & bmask;
                                     }
-                                    if keep && r.ts < 0x8000_0000 && abl != 7 {
-                                        emit!(r, false);
-                                    }
                                     gi += 1;
                                 }
                             }
-                            merged = true;
                         } else {
                             for s in &slices {
                                 if abl == 6 { break; }
@@ -2530,9 +2503,6 @@ fn main() {
                         let tb = tsc();
                         ph[0] += tb - ta;
                         for s in &slices {
-                            if merged {
-                                break;
-                            }
                             let recs = std::slice::from_raw_parts(s.0, s.1);
                             for i in 0..recs.len() {
                                 if has_links && i + 24 < recs.len() {
@@ -2647,7 +2617,6 @@ fn main() {
                 let mut gids: Vec<u32> = Vec::new();
                 let mut rtmp: Vec<u64> = Vec::new();
                 let mut rv2: Vec<u64> = Vec::new();
-                let mut tlist: Vec<(u32, u64)> = Vec::new();
                 let mut rg2: Vec<u32> = Vec::new();
                 let mut vals: Vec<u64> = Vec::new();
                 let mut cgids: Vec<u32> = Vec::new();
@@ -2739,40 +2708,46 @@ fn main() {
                     }
                     eoff.push(acc);
                     if RADIX3 {
-                        // order the partition by ts first (LSD radix, 3 x 11 bits, stable), so that the
-                        // stable placement by person below leaves every person's events sorted by ts
+                        // order the partition by ts first (LSD radix, 4 x 8 bits, stable; all four
+                        // histograms from one read), so that the stable placement by person below leaves
+                        // every person's events sorted by ts
                         rv2.clear();
                         rv2.resize(n, 0);
                         rg2.clear();
                         rg2.resize(n, 0);
-                        let (mut sv, mut sg) = (vals.as_mut_ptr(), gids.as_mut_ptr());
-                        let (mut dv, mut dg) = (rv2.as_mut_ptr(), rg2.as_mut_ptr());
-                        for pass in 0..3u32 {
-                            let shift = 32 + 11 * pass;
-                            let mut cnt = [0u32; 2048];
-                            for i in 0..n {
-                                *cnt.get_unchecked_mut(((*sv.add(i) >> shift) & 2047) as usize) += 1;
-                            }
+                        let mut cnt = [[0u32; 256]; 4];
+                        for i in 0..n {
+                            let t = (*vals.get_unchecked(i) >> 32) as u32;
+                            cnt[0][(t & 255) as usize] += 1;
+                            cnt[1][((t >> 8) & 255) as usize] += 1;
+                            cnt[2][((t >> 16) & 255) as usize] += 1;
+                            cnt[3][(t >> 24) as usize] += 1;
+                        }
+                        for h in cnt.iter_mut() {
                             let mut a = 0u32;
-                            for c in cnt.iter_mut() {
+                            for c in h.iter_mut() {
                                 let x = *c;
                                 *c = a;
                                 a += x;
                             }
+                        }
+                        let (mut sv, mut sg) = (vals.as_mut_ptr(), gids.as_mut_ptr());
+                        let (mut dv, mut dg) = (rv2.as_mut_ptr(), rg2.as_mut_ptr());
+                        for pass in 0..4usize {
+                            let shift = 32 + 8 * pass as u32;
+                            let h = &mut cnt[pass];
                             for i in 0..n {
                                 let v = *sv.add(i);
-                                let d = ((v >> shift) & 2047) as usize;
-                                let o = *cnt.get_unchecked(d) as usize;
-                                *cnt.get_unchecked_mut(d) = o as u32 + 1;
+                                let d = ((v >> shift) & 255) as usize;
+                                let o = *h.get_unchecked(d) as usize;
+                                *h.get_unchecked_mut(d) = o as u32 + 1;
                                 *dv.add(o) = v;
                                 *dg.add(o) = *sg.add(i);
                             }
                             std::mem::swap(&mut sv, &mut dv);
                             std::mem::swap(&mut sg, &mut dg);
                         }
-                        // three passes: the sorted data is in rv2/rg2
-                        std::mem::swap(&mut vals, &mut rv2);
-                        std::mem::swap(&mut gids, &mut rg2);
+                        // four passes: the sorted data is back in vals/gids
                     }
                     evs.clear();
                     evs.resize(n, 0);
@@ -2787,25 +2762,6 @@ fn main() {
                         eoff[g] = eoff[g - 1];
                     }
                     eoff[0] = 0;
-                    // tombstones: (person, ts << 32 | pc) sorted, applied per person after its events are sorted
-                    tlist.clear();
-                    for t in 0..nthreads {
-                        for tr in tomb[t].get()[qi].iter() {
-                            let k = tr.user;
-                            let mut idx = k as usize & gt.mask;
-                            let g = loop {
-                                let kk = *gt.keys.get_unchecked(idx);
-                                if kk == k {
-                                    break *gt.vals.get_unchecked(idx) as usize;
-                                }
-                                assert!(kk != 0, "tombstone without its event");
-                                idx = (idx + 1) & gt.mask;
-                            };
-                            tlist.push((g as u32, ((tr.ts as u64) << 32) | tr.pc as u64));
-                        }
-                    }
-                    tlist.sort_unstable();
-                    let mut tp = 0usize;
                     let t3b = tsc();
                     ph[3] += t3b - t3a;
                     // clicks
@@ -2860,25 +2816,7 @@ fn main() {
                     ph[4] += t3c - t3b;
                     // per person
                     for g in 0..ng {
-                        // the name comes from a random spot of the input (and, for linked persons, the
-                        // names table first): prefetch a few persons ahead
-                        if g + 16 < ng {
-                            let i2 = *ginfo.get_unchecked(g + 16);
-                            if i2 & 1 != 0 {
-                                lm.prefetch_name(*gperson.get_unchecked(g + 16));
-                            } else {
-                                _mm_prefetch(base().add((i2 >> 1) as usize) as *const i8, _MM_HINT_T0);
-                            }
-                        }
-                        if g + 8 < ng {
-                            let i2 = *ginfo.get_unchecked(g + 8);
-                            if i2 & 1 != 0 {
-                                let loc = lm.name(*gperson.get_unchecked(g + 8));
-                                _mm_prefetch(base().add((loc >> 24) as usize) as *const i8, _MM_HINT_T0);
-                            }
-                        }
-                        let tf0 = if PHASE_FINE { tsc() } else { 0 };
-                        let mut ev = &mut evs[eoff[g] as usize..eoff[g + 1] as usize];
+                        let ev = &mut evs[eoff[g] as usize..eoff[g + 1] as usize];
                         if RADIX3 {
                         } else if ev.len() > 1024 {
                             // big persons (whales, shared devices): stable LSD radix sort on ts
@@ -2887,34 +2825,10 @@ fn main() {
                         } else if ev.len() > 1 {
                             ev.sort_unstable();
                         }
-                        if tp < tlist.len() && tlist[tp].0 == g as u32 {
-                            // drop one event equal to each tombstone (bit 63 marks a dropped one), then compact
-                            let key = |x: u64| (x >> 32) & 0x7FFF_FFFF;
-                            while tp < tlist.len() && tlist[tp].0 == g as u32 {
-                                let v = tlist[tp].1;
-                                tp += 1;
-                                let t = v >> 32;
-                                let mut j = ev.partition_point(|&x| key(x) < t);
-                                while j < ev.len() && key(ev[j]) == t {
-                                    if ev[j] == v {
-                                        ev[j] |= 1 << 63;
-                                        break;
-                                    }
-                                    j += 1;
-                                }
-                            }
-                            let mut w = 0;
-                            for r in 0..ev.len() {
-                                let x = ev[r];
-                                if x >> 63 == 0 {
-                                    ev[w] = x;
-                                    w += 1;
-                                }
-                            }
-                            ev = &mut ev[..w];
-                            if w == 0 {
-                                continue;
-                            }
+                        if HIST {
+                            let b = (usize::BITS - ev.len().leading_zeros()) as usize;
+                            SIZEH[b.min(31)].fetch_add(1, Relaxed);
+                            SIZEE[b.min(31)].fetch_add(ev.len() as u64, Relaxed);
                         }
                         let ck = &mut cks[coff[g] as usize..coff[g + 1] as usize];
                         if ck.len() > 1 {
@@ -2926,7 +2840,6 @@ fn main() {
                                 })
                             });
                         }
-                        let tf1 = if PHASE_FINE { tsc() } else { 0 };
                         // name
                         let info = ginfo[g];
                         name_buf.clear();
@@ -2935,11 +2848,6 @@ fn main() {
                         } else {
                             let (np, nl) = field_at(info >> 1, 1);
                             name_buf.extend_from_slice(sl(np, nl));
-                        }
-                        if PHASE_FINE {
-                            let tf2 = tsc();
-                            ph[6] += tf1 - tf0;
-                            ph[7] += tf2 - tf1;
                         }
                         let n = ev.len();
                         let nck = ck.len();
@@ -3188,12 +3096,20 @@ fn main() {
     if timing {
         let el = t0.elapsed().as_secs_f64();
         let _ = el;
-        let names = ["dedup", "map", "clk2", "group", "clk3", "person", "psort", "pname"];
+        let names = ["dedup", "map", "clk2", "group", "clk3", "person"];
         let mut line = String::from("phases(Mcyc, all threads)");
         for (i, n) in names.iter().enumerate() {
             line.push_str(&format!(" {}={}", n, PHASE[i].load(Relaxed) / 1_000_000));
         }
         eprintln!("{line}");
+        if HIST {
+            for b in 0..32 {
+                let c = SIZEH[b].load(Relaxed);
+                if c > 0 {
+                    eprintln!("persons with len < 2^{b}: {c} persons, {} events", SIZEE[b].load(Relaxed));
+                }
+            }
+        }
         if perf_on {
             let mut l = format!("perf(err {})", PERF_ERR.load(Relaxed));
             for st in 0..3 {
