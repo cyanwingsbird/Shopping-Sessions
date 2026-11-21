@@ -936,6 +936,8 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     k
 }
 const SCAN: usize = 1 << 16;
+/// stage-1 event lines in a function of their own
+const EVFN: bool = true;
 /// stage-2 dedup: bitmap prefilter, exact table only for possible copies
 const DEDUPBM: bool = true;
 /// stage 3: partitions of at least SUB3MIN events are split into SUB3 pieces by person hash
@@ -1402,6 +1404,132 @@ impl IdTab {
         let v = *self.vals.get(x as usize)?;
         if v == 0 { None } else { Some(v - 1) }
     }
+}
+
+
+/// Stage 1, event lines starting in [s, cb) (file end fe): parse, validate, stage records by event_id
+/// partition. A function of its own, so that its loop gets the registers to itself.
+struct EvCtx<'a> {
+    prod_tab: &'a IdTab,
+    cat_unknown: u32,
+    ws: i64,
+    we: i64,
+    ing_base: i64,
+    base_ms: i64,
+    p1: usize,
+    strict: bool,
+}
+#[inline(never)]
+unsafe fn ev_lines(cx: &EvCtx, wc1: &mut Wc<Rec, WC1K>, evb: &mut [Vec<Rec>], mut s: usize, cb: usize, fe: usize) {
+    let EvCtx { prod_tab, cat_unknown, ws, we, ing_base, base_ms, p1, strict } = *cx;
+    let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
+    let abl = 0usize;
+    let mut abl_sink = 0u64;
+    let c = Chunk { kind: 0, a: 0, b: cb, fs: 0, fe };
+                        macro_rules! ev_body {
+        ($p:expr, $line:expr, $fld:expr) => {
+        let (f0, l0) = $fld(0);
+        if l0 == 0 || DIAG && abl == 1 {
+            continue;
+        }
+        let h = hash($p.add(f0), l0);
+        let part = (((h >> 32) * p1 as u64) >> 32) as usize;
+        if DIAG && abl == 2 { abl_sink += h; continue; }
+        let (f3, il) = $fld(3);
+        let ip = $p.add(f3);
+        let (f2, l2) = $fld(2);
+        let tp = $p.add(f2);
+        let ing_ok = il == 20 && *ip.add(19) == b'Z';
+        let (t, ing) = if l2 == 20 && *tp.add(19) == b'Z' && ing_ok {
+            let (ts, g) = parse_pair_f1(tp, ip);
+            (if ts == BAD { BAD } else { ts * 1000 }, g)
+        } else {
+            (parse_ts_fast(tp, l2), if ing_ok { parse_ingest(ip) } else { BAD })
+        };
+        let ing_rel = if ing == BAD { 0xFF_FFFF } else { (ing - ing_base).clamp(0, 0xFF_FFFE) as u32 };
+        let mut rec = Rec { user: 0, pp: ($line as u64) << 24, eh: h, ts: INVALID, ic: ing_rel << 8 };
+        'v: {
+            let (f1, ulen) = $fld(1);
+            let (f5, l5) = $fld(5);
+            if ulen == 0 || l5 == 0 {
+                break 'v;
+            }
+            if t < ws || t >= we {
+                break 'v;
+            }
+            let (f4, tl) = $fld(4);
+            let tp = $p.add(f4);
+            if tl == 4 {
+                let w = rd32(tp);
+                let (a, b) = (w ^ u32::from_le_bytes(*b"view"), w ^ u32::from_le_bytes(*b"cart"));
+                // both nonzero <=> bad type; one test, no branch on which of the two it is
+                if ((a | a.wrapping_neg()) & (b | b.wrapping_neg())) >> 31 != 0 {
+                    break 'v;
+                }
+            } else if tl == 8 && rd64(tp) == u64::from_le_bytes(*b"purchase") {
+                let (f6, l6) = $fld(6);
+                let price = parse_price($p.add(f6), l6);
+                if price == 0 {
+                    break 'v;
+                }
+                let cat = prod_tab.get($p.add(f5), l5).unwrap_or(cat_unknown);
+                rec.pp |= price as u64;
+                rec.ic |= cat;
+            } else {
+                break 'v;
+            }
+            if ing != BAD && ing * 1000 - t > DAY_MS {
+                break 'v;
+            }
+            rec.user = hash($p.add(f1), ulen);
+            rec.ts = (t - base_ms) as u32;
+        }
+        if DIAG && abl == 3 { abl_sink += rec.user + rec.ts as u64; continue; }
+        wc1.push(evb, part, rec);
+        };
+    }
+                        if !SCANNL {
+        // line by line: the splitter's line length gives the next line's start
+        while s < c.b {
+            let line_at = s;
+            let p = base().add(line_at);
+            if PFD > 0 {
+                _mm_prefetch(p.add(PFD) as *const i8, _MM_HINT_T0);
+            }
+            let sp = if strict { Sp7 { kind: 2, ..Default::default() } } else { split_ev7f(p, c.fe - line_at) };
+            if sp.kind == 0 {
+                s = line_at + sp.len as usize + 1;
+                let fld = |k: usize| -> (usize, usize) { sp.field(k) };
+                ev_body!(p, line_at, fld);
+                continue;
+            }
+            if sp.kind == 1 {
+                s = line_at + sp.len as usize + 1;
+                continue;
+            }
+            let (l, ok) = if strict {
+                splitn::<7>(p, c.fe - line_at, &mut st, &mut en)
+            } else {
+                let (l, r) = split_gen_full::<7>(p, c.fe - line_at, &mut st, &mut en);
+                if r == 2 {
+                    for k in 0..7 {
+                        let (a, b) = (st[k], en[k]);
+                        let q = (a < b && *p.add(a as usize) == b'"') as u32;
+                        st[k] = a + q;
+                        en[k] = b - q;
+                    }
+                }
+                (l, r != 0)
+            };
+            s = line_at + l + 1;
+            if !ok {
+                continue;
+            }
+            let fld = |k: usize| -> (usize, usize) { (st[k] as usize, (en[k] - st[k]) as usize) };
+            ev_body!(p, line_at, fld);
+        }
+    }
+    std::hint::black_box(abl_sink);
 }
 
 // ---------------------------------------------------------------- links
@@ -2537,6 +2665,7 @@ fn main() {
                 let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
                 let mut abl_sink = 0u64;
                 let mut wc1: Wc<Rec, WC1K> = Wc::new(p1);
+                let evcx = EvCtx { prod_tab, cat_unknown, ws, we, ing_base, base_ms, p1, strict };
                 let mut nlbuf: Vec<u32> = vec![0u32; SCAN + 64];
                 let mut wcc1: Wc<RecC, 8> = Wc::new(p1c);
                 // clicks need no dedup (copies are identical): their chunks come last in stage 1, when the
@@ -2645,7 +2774,11 @@ fn main() {
                             wc1.push(evb, part, rec);
                             };
                         }
-                        if !SCANNL {
+                        if EVFN && !SCANNL && !DIAG {
+                            ev_lines(&evcx, &mut wc1, evb, s, c.b, c.fe);
+                            s = c.b;
+                        }
+                        if !SCANNL && !(EVFN && !DIAG) {
                             // line by line: the splitter's line length gives the next line's start
                             while s < c.b {
                                 let line_at = s;
