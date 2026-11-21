@@ -264,12 +264,7 @@ unsafe fn hash(p: *const u8, len: usize) -> u64 {
         a = rd64(p.add(len - 16));
         b = rd64(p.add(len - 8));
     }
-    let h = if HASH1 && len <= 16 {
-        // one 64x64->128 multiply: a and b are masked ASCII, so neither operand can be zero
-        mum(a ^ S1, b ^ S0 ^ ((len as u64) << 59))
-    } else {
-        mum(mum(a ^ S1, b ^ seed) ^ (len as u64).wrapping_mul(S0), S0 ^ S1)
-    };
+    let h = mum(mum(a ^ S1, b ^ seed) ^ (len as u64).wrapping_mul(S0), S0 ^ S1);
     h | ((h == 0) as u64)
 }
 
@@ -832,26 +827,6 @@ unsafe fn scan_nl(p: *const u8, n: usize, out: *mut u32) -> usize {
     k
 }
 const SCAN: usize = 1 << 16;
-/// assists counted per activation interval of a campaign instead of per session
-const ASSIST_IV: bool = true;
-/// stage 2: link lookups and scatter in two passes over each partition
-const MAP2: bool = false;
-/// per-person sub-phases in the SS_TIMING report
-const PHASE_FINE: bool = false;
-/// stage 3: radix-sort each partition's clicks by ts instead of sorting each person's clicks
-const CKRADIX: bool = true;
-/// bit filter in front of the link table
-const LFILT: bool = true;
-/// records per partition staged before a streaming write in stage 2 (24-byte records: 4 or 8)
-const WC2K: usize = 8;
-/// event lines: prefetch this many bytes ahead (0 = rely on the hardware prefetcher)
-const PFD: usize = 0;
-/// all threads parse the link files before thread 0 builds the map
-const PLINKS: bool = true;
-/// ids of up to 16 bytes hashed with a single multiply
-const HASH1: bool = true;
-/// find line ends with a separate pass over each 64 KB block (else: from the splitter, line by line)
-const SCANNL: bool = false;
 /// stage 3: radix-sort each partition by ts instead of sorting each person's events
 const RADIX3: bool = true;
 const HIST: bool = false;
@@ -1239,7 +1214,7 @@ impl LinkMap {
     #[inline(always)]
     unsafe fn bucket_ptr(&self, k: u64) -> (*const LBucket, u64, usize) {
         let fi = (k >> 32) as usize & self.fmask;
-        let bit = if LFILT { (*self.filt.get_unchecked(fi >> 6) >> (fi & 63)) & 1 } else { 1 };
+        let bit = (*self.filt.get_unchecked(fi >> 6) >> (fi & 63)) & 1;
         let i = self.bucket(k);
         let p = if bit != 0 { self.slots.as_ptr().add(i) } else { &self.empty as *const LBucket };
         (p, bit, i)
@@ -1290,20 +1265,6 @@ impl LinkMap {
     unsafe fn prefetch(&self, k: u64) {
         _mm_prefetch(self.bucket_ptr(k).0 as *const i8, _MM_HINT_T0);
     }
-}
-/// field 1 (user_id) of the event line at pos, quotes stripped; one 64-byte mask when it fits
-#[inline(always)]
-unsafe fn user_at(pos: u64) -> (*const u8, usize) {
-    let p = base().add(pos as usize);
-    let (_, c, _) = masks64(p);
-    let c1 = c & c.wrapping_sub(1);
-    if c1 == 0 {
-        return field_at(pos, 1);
-    }
-    let a = c.trailing_zeros() as usize + 1;
-    let b = c1.trailing_zeros() as usize;
-    let q = (b > a && *p.add(a) == b'"') as usize;
-    (p.add(a + q), b - a - 2 * q)
 }
 unsafe fn name_bytes<'a>(loc: u64) -> &'a [u8] {
     sl(base().add((loc >> 24) as usize), (loc & 0xFF_FFFF) as usize)
@@ -2182,18 +2143,6 @@ fn main() {
     let next_p1 = AtomicUsize::new(0);
     let next_q = AtomicUsize::new(0);
     let barrier = Barrier::new(nthreads);
-    // link files are parsed by all threads first (256 KB chunks), then one thread builds the map
-    let mut lchunks: Vec<Chunk> = Vec::new();
-    for sg in ln_segs.iter() {
-        let mut a = sg.start;
-        while a < sg.end {
-            let b = (a + (256 << 10)).min(sg.end);
-            lchunks.push(Chunk { kind: 2, a, b, fs: sg.start, fe: sg.end });
-            a = b;
-        }
-    }
-    let next_lchunk = AtomicUsize::new(0);
-    let lraw: Vec<Sh<Vec<LinkRaw>>> = (0..nthreads).map(|_| Sh::new(Vec::new())).collect();
     let _ = std::fs::create_dir_all(format!("{out_dir}/user_daily"));
     let _ = std::fs::create_dir_all(format!("{out_dir}/campaign_daily"));
     if timing {
@@ -2205,49 +2154,12 @@ fn main() {
             let (chunks, ev1, ck1, ev2, ck2, cells, linkmap, assists) = (&chunks, &ev1, &ck1, &ev2, &ck2, &cells, &linkmap, &assists);
             let (next_chunk, next_p1, next_q, barrier) = (&next_chunk, &next_p1, &next_q, &barrier);
             let links_ready = &links_ready;
-            let (lchunks, next_lchunk, lraw) = (&lchunks, &next_lchunk, &lraw);
             let (prod_tab, camp_tab, ln_segs, cat_names, cat_rank, out_dir) = (&prod_tab, &camp_tab, &ln_segs, &cat_names, &cat_rank, &out_dir);
             let body = move || unsafe {
                 let mut perf = Perf::open(perf_on);
-                // ================= links: parsed by all threads, built by thread 0
-                if PLINKS {
-                    let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
-                    let mine = lraw[tid].get();
-                    loop {
-                        let ci = next_lchunk.fetch_add(1, Relaxed);
-                        if ci >= lchunks.len() {
-                            break;
-                        }
-                        let c = lchunks[ci];
-                        // first line starting in [a, b); the file's first line is the header
-                        let mut s = if c.a == c.fs { c.a } else { c.a - 1 };
-                        while s < c.fe && *base().add(s) != b'\n' {
-                            s += 1;
-                        }
-                        s += 1;
-                        while s < c.b {
-                            let p = base().add(s);
-                            let (len, ok) = splitn::<2>(p, c.fe - s, &mut st, &mut en);
-                            if ok && en[0] > st[0] && en[1] > st[1] {
-                                let (la, lb) = ((en[0] - st[0]) as usize, (en[1] - st[1]) as usize);
-                                mine.push(LinkRaw {
-                                    ha: hash(p.add(st[0] as usize), la),
-                                    hb: hash(p.add(st[1] as usize), lb),
-                                    la: (((s + st[0] as usize) as u64) << 24) | la as u64,
-                                    lb: (((s + st[1] as usize) as u64) << 24) | lb as u64,
-                                });
-                            }
-                            s += len + 1;
-                        }
-                    }
-                    barrier.wait();
-                }
+                // ================= links (thread 0)
                 if tid == 0 {
-                    let mut raw: Vec<LinkRaw> = Vec::with_capacity((0..nthreads).map(|t| lraw[t].get().len()).sum());
-                    for t in 0..nthreads {
-                        raw.extend_from_slice(lraw[t].get());
-                    }
-                    if !PLINKS {
+                    let mut raw: Vec<LinkRaw> = Vec::new();
                     let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
                     for seg in ln_segs.iter() {
                         let mut s = seg.start;
@@ -2270,7 +2182,6 @@ fn main() {
                             }
                             s += len + 1;
                         }
-                    }
                     }
                     let tl = t0.elapsed();
                     *linkmap.get() = build_links(&raw);
@@ -2397,48 +2308,7 @@ fn main() {
                             wc1.push(evb, part, rec);
                             };
                         }
-                        if !SCANNL {
-                            // line by line: the splitter's line length gives the next line's start
-                            while s < c.b {
-                                let line_at = s;
-                                let p = base().add(line_at);
-                                if PFD > 0 {
-                                    _mm_prefetch(p.add(PFD) as *const i8, _MM_HINT_T0);
-                                }
-                                let sp = if strict { Sp7 { kind: 2, ..Default::default() } } else { split_ev7f(p, c.fe - line_at) };
-                                if sp.kind == 0 {
-                                    s = line_at + sp.len as usize + 1;
-                                    let fld = |k: usize| -> (usize, usize) { sp.field(k) };
-                                    ev_body!(p, line_at, fld);
-                                    continue;
-                                }
-                                if sp.kind == 1 {
-                                    s = line_at + sp.len as usize + 1;
-                                    continue;
-                                }
-                                let (l, ok) = if strict {
-                                    splitn::<7>(p, c.fe - line_at, &mut st, &mut en)
-                                } else {
-                                    let (l, r) = split_gen_full::<7>(p, c.fe - line_at, &mut st, &mut en);
-                                    if r == 2 {
-                                        for k in 0..7 {
-                                            let (a, b) = (st[k], en[k]);
-                                            let q = (a < b && *p.add(a as usize) == b'"') as u32;
-                                            st[k] = a + q;
-                                            en[k] = b - q;
-                                        }
-                                    }
-                                    (l, r != 0)
-                                };
-                                s = line_at + l + 1;
-                                if !ok {
-                                    continue;
-                                }
-                                let fld = |k: usize| -> (usize, usize) { (st[k] as usize, (en[k] - st[k]) as usize) };
-                                ev_body!(p, line_at, fld);
-                            }
-                        }
-                        'blocks: while SCANNL && s < c.b {
+                        'blocks: while s < c.b {
                         // line ends of the next SCAN bytes first, so that each line's parse does not wait
                         // on the previous line's newline search
                         let scan_end = (s + SCAN).min(c.fe);
@@ -2593,7 +2463,7 @@ fn main() {
                 *e2 = (0..q).map(|_| Vec::with_capacity(est_ev / (q * nthreads) * 5 / 4 + 64)).collect();
                 let mut table: Vec<u64> = Vec::new();
                 let mut table32: Vec<u32> = Vec::new();
-                let mut wc2: Wc<Rec2, WC2K> = Wc::new(q);
+                let mut wc2: Wc<Rec2, 8> = Wc::new(q);
                 let mut ph = [0u64; 8];
                 loop {
                     let pi = next_p1.fetch_add(1, Relaxed);
@@ -2713,38 +2583,7 @@ fn main() {
                         }
                         let tb = tsc();
                         ph[0] += tb - ta;
-                        if MAP2 && has_links {
-                            // persons first (link-table lookups only), then the scatter (write-combining
-                            // buffers only): the two working sets do not compete for the cache
-                            for s in &slices {
-                                let recs = std::slice::from_raw_parts_mut(s.0, s.1);
-                                for i in 0..recs.len() {
-                                    if i + 24 < recs.len() {
-                                        lm.prefetch(recs.get_unchecked(i + 24).user);
-                                    }
-                                    let r = recs.get_unchecked_mut(i);
-                                    let (pu, linked) = lm.map(r.user);
-                                    r.eh = pu;
-                                    r.user = linked as u64;
-                                }
-                            }
-                            for s in &slices {
-                                let recs = std::slice::from_raw_parts(s.0, s.1);
-                                for i in 0..recs.len() {
-                                    let r = recs.get_unchecked(i);
-                                    if r.ts >= 0x8000_0000 {
-                                        continue;
-                                    }
-                                    let o = Rec2 { user: r.eh, pos: ((r.pp >> 24) << 1) | r.user, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
-                                    let part = (((o.user >> 32) * q as u64) >> 32) as usize;
-                                    wc2.push(e2, part, o);
-                                }
-                            }
-                        }
                         for s in &slices {
-                            if MAP2 && has_links {
-                                break;
-                            }
                             let recs = std::slice::from_raw_parts(s.0, s.1);
                             for i in 0..recs.len() {
                                 if has_links && i + 24 < recs.len() {
@@ -2868,8 +2707,6 @@ fn main() {
                 let mut vals: Vec<u64> = Vec::new();
                 let mut cgids: Vec<u32> = Vec::new();
                 let mut ctmp: Vec<(u32, u32, u64)> = Vec::new();
-                let mut ctmp2: Vec<(u32, u32, u64)> = Vec::new();
-                let mut cg2: Vec<u32> = Vec::new();
                 let mut eoff: Vec<u32> = Vec::new();
                 let mut coff: Vec<u32> = Vec::new();
                 let mut ginfo: Vec<u64> = Vec::new(); // pos << 1 | linked ; and person
@@ -2879,10 +2716,6 @@ fn main() {
                 let mut catsum = vec![0u64; 256];
                 let mut touched: Vec<u8> = Vec::new();
                 let mut ccnt = vec![0u32; ncamp + 1];
-                // assists by activation interval: astart[c] = index of the first session for which campaign
-                // c (now active) has a click in the window; pdays = (day, index of its first session)
-                let mut astart = vec![0u32; ncamp + 1];
-                let mut pdays: Vec<(u32, u32)> = Vec::new();
                 let mut cpos = vec![0u32; ncamp + 1];
                 let mut active: Vec<u32> = Vec::new();
                 let mut name_buf: Vec<u8> = Vec::new();
@@ -3052,48 +2885,6 @@ fn main() {
                             *x = acc;
                             acc += c;
                         }
-                        if CKRADIX && ncl > 1 {
-                            // order by ts first (LSD radix, 4 x 8 bits, stable), so that the stable placement
-                            // by person below leaves every person's clicks sorted by ts
-                            ctmp2.clear();
-                            ctmp2.reserve(ncl);
-                            ctmp2.set_len(ncl);
-                            cg2.clear();
-                            cg2.reserve(ncl);
-                            cg2.set_len(ncl);
-                            let mut cnt = [[0u32; 256]; 4];
-                            for i in 0..ncl {
-                                let t = ctmp.get_unchecked(i).0;
-                                cnt[0][(t & 255) as usize] += 1;
-                                cnt[1][((t >> 8) & 255) as usize] += 1;
-                                cnt[2][((t >> 16) & 255) as usize] += 1;
-                                cnt[3][(t >> 24) as usize] += 1;
-                            }
-                            for h in cnt.iter_mut() {
-                                let mut a = 0u32;
-                                for c in h.iter_mut() {
-                                    let x = *c;
-                                    *c = a;
-                                    a += x;
-                                }
-                            }
-                            let (mut sv, mut sg) = (ctmp.as_mut_ptr(), cgids.as_mut_ptr());
-                            let (mut dv, mut dg) = (ctmp2.as_mut_ptr(), cg2.as_mut_ptr());
-                            for pass in 0..4usize {
-                                let shift = 8 * pass as u32;
-                                let h = &mut cnt[pass];
-                                for i in 0..ncl {
-                                    let v = *sv.add(i);
-                                    let d = ((v.0 >> shift) & 255) as usize;
-                                    let o = *h.get_unchecked(d) as usize;
-                                    *h.get_unchecked_mut(d) = o as u32 + 1;
-                                    *dv.add(o) = v;
-                                    *dg.add(o) = *sg.add(i);
-                                }
-                                std::mem::swap(&mut sv, &mut dv);
-                                std::mem::swap(&mut sg, &mut dg);
-                            }
-                        }
                         cks.clear();
                         cks.resize(ncl, (0, 0, 0));
                         for i in 0..cgids.len() {
@@ -3125,9 +2916,8 @@ fn main() {
                             SIZEH[b.min(31)].fetch_add(1, Relaxed);
                             SIZEE[b.min(31)].fetch_add(ev.len() as u64, Relaxed);
                         }
-                        let tq0 = if PHASE_FINE { tsc() } else { 0 };
                         let ck = &mut cks[coff[g] as usize..coff[g + 1] as usize];
-                        if !CKRADIX && ck.len() > 1 {
+                        if ck.len() > 1 {
                             ck.sort_unstable_by(|a, b| {
                                 a.0.cmp(&b.0).then_with(|| {
                                     let (ap, al) = field_at(a.2, 0);
@@ -3136,63 +2926,21 @@ fn main() {
                                 })
                             });
                         }
-                        let tq1 = if PHASE_FINE { tsc() } else { 0 };
-                        ph[6] += tq1 - tq0;
-                        // names are read from the input lines: fetch them a few persons ahead
-                        if g + 8 < ng {
-                            let inf = *ginfo.get_unchecked(g + 8);
-                            if inf & 1 != 0 {
-                                let k = *gperson.get_unchecked(g + 8);
-                                _mm_prefetch(lm.names.as_ptr().add(k as usize & lm.nmask) as *const i8, _MM_HINT_T0);
-                            } else {
-                                _mm_prefetch(base().add((inf >> 1) as usize) as *const i8, _MM_HINT_T0);
-                            }
-                        }
-                        if g + 4 < ng && *ginfo.get_unchecked(g + 4) & 1 != 0 {
-                            let loc = lm.name(*gperson.get_unchecked(g + 4));
-                            _mm_prefetch(base().add((loc >> 24) as usize) as *const i8, _MM_HINT_T0);
-                        }
                         // name
                         let info = ginfo[g];
                         name_buf.clear();
                         if info & 1 != 0 {
                             name_buf.extend_from_slice(name_bytes(lm.name(gperson[g])));
                         } else {
-                            let (np, nl) = user_at(info >> 1);
+                            let (np, nl) = field_at(info >> 1, 1);
                             name_buf.extend_from_slice(sl(np, nl));
                         }
-                        let tq2 = if PHASE_FINE { tsc() } else { 0 };
-                        ph[7] += tq2 - tq1;
                         let n = ev.len();
                         let nck = ck.len();
                         let (mut lo, mut hi) = (0usize, 0usize);
                         let mut cur_day = u32::MAX;
                         let (mut r_sessions, mut r_events, mut r_rev) = (0i32, 0i32, 0i64);
                         let mut i = 0;
-                        let mut sidx = 0u32;
-                        pdays.clear();
-                        // add sessions [i0, i1) of campaign a to its assists, day by day
-                        macro_rules! assist {
-                            ($a:expr, $i0:expr, $i1:expr) => {{
-                                let (a, i0, i1) = ($a as usize, $i0, $i1);
-                                if i1 > i0 {
-                                    let mut k = pdays.len() - 1;
-                                    while pdays.get_unchecked(k).1 > i0 {
-                                        k -= 1;
-                                    }
-                                    loop {
-                                        let (d, s0) = *pdays.get_unchecked(k);
-                                        let s1 = if k + 1 < pdays.len() { pdays.get_unchecked(k + 1).1 } else { u32::MAX };
-                                        let (lo, hi) = (i0.max(s0), i1.min(s1));
-                                        *asst_cells.get_unchecked_mut(a * nd + d as usize) += hi - lo;
-                                        k += 1;
-                                        if k == pdays.len() || pdays.get_unchecked(k).1 >= i1 {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }};
-                        }
                         macro_rules! flush {
                             () => {
                                 out.names.extend_from_slice(&(name_buf.len() as u32).to_le_bytes());
@@ -3230,9 +2978,6 @@ fn main() {
                                     flush!();
                                 }
                                 cur_day = day;
-                                if ASSIST_IV {
-                                    pdays.push((day, sidx));
-                                }
                                 r_sessions = 0;
                                 r_events = 0;
                                 r_rev = 0;
@@ -3271,7 +3016,6 @@ fn main() {
                                     if ccnt[c] == 0 {
                                         cpos[c] = active.len() as u32;
                                         active.push(c as u32);
-                                        *astart.get_unchecked_mut(c) = sidx;
                                     }
                                     ccnt[c] += 1;
                                     hi += 1;
@@ -3280,9 +3024,6 @@ fn main() {
                                     let c = ck.get_unchecked(lo).1 as usize;
                                     ccnt[c] -= 1;
                                     if ccnt[c] == 0 {
-                                        if ASSIST_IV {
-                                            assist!(c, *astart.get_unchecked(c), sidx);
-                                        }
                                         let p = cpos[c] as usize;
                                         let last = active.pop().unwrap();
                                         if last as usize != c {
@@ -3293,31 +3034,12 @@ fn main() {
                                     lo += 1;
                                 }
                                 if hi > lo {
-                                    let j = hi - 1;
-                                    camp = ck.get_unchecked(j).1 as usize;
-                                    if CKRADIX && j > lo && ck.get_unchecked(j - 1).0 == ck.get_unchecked(j).0 {
-                                        // clicks at the same ms: the smallest click_id
-                                        let t = ck.get_unchecked(j).0;
-                                        let mut best = j;
-                                        let mut k = j;
-                                        while k > lo && ck.get_unchecked(k - 1).0 == t {
-                                            k -= 1;
-                                            let (ap, al) = field_at(ck.get_unchecked(k).2, 0);
-                                            let (bp, bl) = field_at(ck.get_unchecked(best).2, 0);
-                                            if sl(ap, al) < sl(bp, bl) {
-                                                best = k;
-                                            }
-                                        }
-                                        camp = ck.get_unchecked(best).1 as usize;
-                                    }
+                                    camp = ck.get_unchecked(hi - 1).1 as usize;
                                 }
-                                if !ASSIST_IV {
-                                    for &a in &active {
-                                        *asst_cells.get_unchecked_mut(a as usize * nd + day as usize) += 1;
-                                    }
+                                for &a in &active {
+                                    *asst_cells.get_unchecked_mut(a as usize * nd + day as usize) += 1;
                                 }
                             }
-                            sidx += 1;
                             let ce = cell.get_unchecked_mut(camp * nd + day as usize);
                             ce.sessions += 1;
                             ce.purch += s_purch;
@@ -3326,9 +3048,6 @@ fn main() {
                         flush!();
                         if nck != 0 {
                             for &a in &active {
-                                if ASSIST_IV {
-                                    assist!(a, *astart.get_unchecked(a as usize), sidx);
-                                }
                                 ccnt[a as usize] = 0;
                             }
                             active.clear();
@@ -3463,7 +3182,7 @@ fn main() {
     if timing {
         let el = t0.elapsed().as_secs_f64();
         let _ = el;
-        let names = ["dedup", "map", "clk2", "group", "clk3", "person", "cksort", "name"];
+        let names = ["dedup", "map", "clk2", "group", "clk3", "person"];
         let mut line = String::from("phases(Mcyc, all threads)");
         for (i, n) in names.iter().enumerate() {
             line.push_str(&format!(" {}={}", n, PHASE[i].load(Relaxed) / 1_000_000));

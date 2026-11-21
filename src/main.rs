@@ -1193,6 +1193,87 @@ impl StrTable {
     }
 }
 
+/// Id lookup: when every id in the file is one fixed prefix (at most 8 bytes) followed by a decimal
+/// number of at most 7 digits without leading zeros (as `p123` and `c_45` in the generator), the id
+/// maps to a slot of a plain array; any other spelling cannot be in the file. Otherwise a StrTable.
+struct IdTab {
+    pre: u64,      // prefix bytes, little-endian
+    plen: usize,   // 0 = no numeric form (use st)
+    vals: Vec<u32>, // value + 1, 0 = absent
+    st: StrTable,
+}
+impl IdTab {
+    fn new(ids: &[&[u8]], vals: &[u32]) -> IdTab {
+        let general = || {
+            let mut st = StrTable::new(ids.len());
+            for (k, &v) in ids.iter().zip(vals) {
+                st.insert(k, v);
+            }
+            IdTab { pre: 0, plen: 0, vals: Vec::new(), st }
+        };
+        if ids.is_empty() || std::env::var_os("SS_NO_IDNUM").is_some() {
+            return general();
+        }
+        let split = |k: &'_ [u8]| -> Option<(usize, u32)> {
+            let p = k.iter().position(|c| c.is_ascii_digit())?;
+            let d = &k[p..];
+            if p == 0 || p > 8 || d.is_empty() || d.len() > 7 || d[0] == b'0' {
+                return None;
+            }
+            let mut n = 0u32;
+            for &c in d {
+                if !c.is_ascii_digit() {
+                    return None;
+                }
+                n = n * 10 + (c - b'0') as u32;
+            }
+            Some((p, n))
+        };
+        let pre: &[u8] = match split(ids[0]) {
+            Some((p, _)) => &ids[0][..p],
+            None => return general(),
+        };
+        let mut nums = Vec::with_capacity(ids.len());
+        for k in ids {
+            match split(k) {
+                Some((p, n)) if &k[..p] == pre && n < (1 << 22) => nums.push(n),
+                _ => return general(),
+            }
+        }
+        let mut arr = vec![0u32; *nums.iter().max().unwrap() as usize + 1];
+        for (n, &v) in nums.iter().zip(vals) {
+            if arr[*n as usize] == 0 {
+                arr[*n as usize] = v + 1;
+            }
+        }
+        let mut pb = [0u8; 8];
+        pb[..pre.len()].copy_from_slice(&pre);
+        IdTab { pre: u64::from_le_bytes(pb), plen: pre.len(), vals: arr, st: StrTable::new(0) }
+    }
+    /// value of the id at p (16 readable bytes past p + len)
+    #[inline(always)]
+    unsafe fn get(&self, p: *const u8, len: usize) -> Option<u32> {
+        if self.plen == 0 {
+            return self.st.get(p, len);
+        }
+        let n = len.wrapping_sub(self.plen);
+        if n.wrapping_sub(1) >= 7 || _bzhi_u64(rd64(p), (self.plen * 8) as u32) != self.pre {
+            return None;
+        }
+        // n digits, left-padded with '0' to 8 bytes, then the 8-digit SWAR conversion
+        let v = (rd64(p.add(self.plen)) << (8 * (8 - n))) | (0x3030_3030_3030_3030u64 >> (8 * n));
+        let t = v ^ 0x3030_3030_3030_3030;
+        if (((t.wrapping_add(0x7676_7676_7676_7676)) | t) & 0x8080_8080_8080_8080) != 0 || (t >> (8 * (8 - n))) & 0xFF == 0 {
+            return None;
+        }
+        let mut x = t;
+        x = x.wrapping_mul(10) + (x >> 8);
+        x = (((x & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000u64 << 32))) + (((x >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000u64 << 32)))) >> 32;
+        let v = *self.vals.get(x as usize)?;
+        if v == 0 { None } else { Some(v - 1) }
+    }
+}
+
 // ---------------------------------------------------------------- links
 #[derive(Clone, Copy)]
 struct LinkRaw {
@@ -2077,13 +2158,15 @@ fn main() {
     let ing_base = base_ms / 1000 - 30 * 86400;
     let nd = (((we - base_ms) as u64 + day_off) / DAY_MS as u64 + 1) as usize;
 
+    let tsu0 = t0.elapsed();
     // ---- dimension tables
     let prods = read_two_col(&format!("{data_dir}/products.csv"));
     let camps = read_two_col(&format!("{data_dir}/campaigns.csv"));
+    let tsu0b = t0.elapsed();
     let mut cat_names: Vec<Vec<u8>> = Vec::new();
     let mut cat_tab = StrTable::new(64);
-    let mut prod_tab = StrTable::new(prods.rows.len());
-    prod_tab.bytes.reserve(prods.data.len());
+    let mut pids: Vec<&[u8]> = Vec::with_capacity(prods.rows.len());
+    let mut pcat: Vec<u32> = Vec::with_capacity(prods.rows.len());
     for r in 0..prods.rows.len() {
         let (p, c) = (prods.a(r), prods.b(r));
         let ci = match unsafe { cat_tab.get(c.as_ptr(), c.len()) } {
@@ -2095,9 +2178,10 @@ fn main() {
                 i
             }
         };
-        prod_tab.insert(p, ci);
+        pids.push(p);
+        pcat.push(ci);
     }
-    prod_tab.finish();
+    let prod_tab = IdTab::new(&pids, &pcat);
     cat_tab.finish();
     let cat_unknown = cat_names.len() as u32;
     cat_names.push(b"unknown".to_vec());
@@ -2110,14 +2194,12 @@ fn main() {
     for (r, &i) in order.iter().enumerate() {
         cat_rank[i] = r as u32;
     }
-    let mut camp_tab = StrTable::new(camps.rows.len());
-    for r in 0..camps.rows.len() {
-        camp_tab.insert(camps.a(r), r as u32);
-    }
-    camp_tab.finish();
+    let cids: Vec<&[u8]> = (0..camps.rows.len()).map(|r| camps.a(r)).collect();
+    let camp_tab = IdTab::new(&cids, &(0..camps.rows.len() as u32).collect::<Vec<u32>>());
     let ncamp = camps.rows.len();
     assert!(ncamp < 65535, "too many campaigns");
 
+    let tsu1 = t0.elapsed();
     // ---- map input files into one region
     let ev_files = list_csv(&format!("{data_dir}/events"));
     let ck_files = list_csv(&format!("{data_dir}/clicks"));
@@ -2146,6 +2228,7 @@ fn main() {
     let ln_segs = map_files(&ln_files);
     let ev_segs = map_files(&ev_files);
     let ck_segs = map_files(&ck_files);
+    let tsu2 = t0.elapsed();
     let ev_bytes: usize = ev_segs.iter().map(|s| s.end - s.start).sum();
     let ck_bytes: usize = ck_segs.iter().map(|s| s.end - s.start).sum();
 
@@ -2197,7 +2280,7 @@ fn main() {
     let _ = std::fs::create_dir_all(format!("{out_dir}/user_daily"));
     let _ = std::fs::create_dir_all(format!("{out_dir}/campaign_daily"));
     if timing {
-        eprintln!("setup {:?} v4={} threads={} p1={} p1c={} q={} chunks={}", t0.elapsed(), cfg!(target_feature = "avx512bw"), nthreads, p1, p1c, q, chunks.len());
+        eprintln!("setup {:?} (manifest {:?} read {:?} dims {:?} mmap {:?}) v4={} threads={} p1={} p1c={} q={} chunks={}", t0.elapsed(), tsu0, tsu0b, tsu1, tsu2, cfg!(target_feature = "avx512bw"), nthreads, p1, p1c, q, chunks.len());
     }
 
     std::thread::scope(|sc| {
