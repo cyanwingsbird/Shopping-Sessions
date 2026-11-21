@@ -2393,6 +2393,13 @@ fn main() {
                             if r == 0 || l0 == 0 || l1 == 0 {
                                 continue;
                             }
+                            // user first: its link-table line is fetched while ts and campaign are parsed
+                            let uh = hash(p.add(f1), l1);
+                            if ck_direct {
+                                if let Some(l) = lm1 {
+                                    l.prefetch(uh);
+                                }
+                            }
                             let t = parse_ts_fast(p.add(f3), l3);
                             if t < base_ms || t >= we {
                                 continue;
@@ -2401,7 +2408,6 @@ fn main() {
                                 Some(c) => c,
                                 None => continue,
                             };
-                            let uh = hash(p.add(f1), l1);
                             if ck_direct {
                                 let lmr = match lm1 {
                                     Some(l) => l,
