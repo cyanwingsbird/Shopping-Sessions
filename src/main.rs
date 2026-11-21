@@ -970,6 +970,35 @@ const PFG: usize = 0;
 const PFD2: usize = 8;
 /// pin each thread to one of the allowed CPUs
 const PIN: bool = true;
+/// how threads are placed (SS_PINMODE overrides): 0 none, 1 allowed CPUs in order,
+/// 2 one hyperthread of every physical core first, 3 like 2 but no pinning when more CPUs are allowed than threads
+const PINMODE: usize = 1;
+
+/// Allowed CPUs reordered so the first hyperthread of every physical core comes before any sibling
+/// (sysfs thread_siblings_list; the list is returned unchanged if it cannot be read).
+fn core_first(v: Vec<usize>) -> Vec<usize> {
+    let mut keyed: Vec<(usize, usize, usize)> = Vec::with_capacity(v.len());
+    let mut seen: Vec<(usize, usize)> = Vec::new();
+    for (i, &c) in v.iter().enumerate() {
+        let path = format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list");
+        let Ok(t) = std::fs::read_to_string(&path) else { return v };
+        let first: String = t.trim().chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        let Ok(core) = first.parse::<usize>() else { return v };
+        let rank = match seen.iter_mut().find(|e| e.0 == core) {
+            Some(e) => {
+                e.1 += 1;
+                e.1
+            }
+            None => {
+                seen.push((core, 0));
+                0
+            }
+        };
+        keyed.push((rank, i, c));
+    }
+    keyed.sort();
+    keyed.into_iter().map(|k| k.2).collect()
+}
 /// stage 2: link-table prefetch distance (records)
 const PF2: usize = 24;
 /// clicks are mapped to persons this many clicks after their link-table line was prefetched
@@ -3771,7 +3800,14 @@ fn main() {
                 }
             }
         }
-        if v.len() < nthreads { Vec::new() } else { v }
+        let mode = envn("SS_PINMODE").unwrap_or(PINMODE);
+        if v.len() < nthreads || mode == 0 || (mode == 3 && v.len() > nthreads) {
+            Vec::new()
+        } else if mode >= 2 {
+            core_first(v)
+        } else {
+            v
+        }
     };
     // link files are parsed by all threads first (256 KB chunks), then one thread builds the map
     let mut lchunks: Vec<Chunk> = Vec::new();
@@ -3788,7 +3824,7 @@ fn main() {
     let _ = std::fs::create_dir_all(format!("{out_dir}/user_daily"));
     let _ = std::fs::create_dir_all(format!("{out_dir}/campaign_daily"));
     if timing {
-        eprintln!("setup {:?} (manifest {:?} read {:?} dims {:?} mmap {:?}) v4={} threads={} p1={} p1c={} q={} chunks={}", t0.elapsed(), tsu0, tsu0b, tsu1, tsu2, cfg!(target_feature = "avx512bw"), nthreads, p1, p1c, q, chunks.len());
+        eprintln!("setup {:?} (manifest {:?} read {:?} dims {:?} mmap {:?}) v4={} threads={} p1={} p1c={} q={} chunks={} cpus={:?}", t0.elapsed(), tsu0, tsu0b, tsu1, tsu2, cfg!(target_feature = "avx512bw"), nthreads, p1, p1c, q, chunks.len(), cpus);
     }
 
     std::thread::scope(|sc| {
