@@ -200,19 +200,9 @@ unsafe fn hash(p: *const u8, len: usize) -> u64 {
     let (a, b);
     let mut seed = S2;
     if len <= 16 {
-        if len >= 8 {
-            a = rd64(p);
-            b = rd64(p.add(len - 8));
-        } else if len >= 4 {
-            a = rd32(p) as u64;
-            b = rd32(p.add(len - 4)) as u64;
-        } else if len > 0 {
-            a = ((*p as u64) << 16) | ((*p.add(len >> 1) as u64) << 8) | (*p.add(len - 1) as u64);
-            b = 0;
-        } else {
-            a = 0;
-            b = 0;
-        }
+        // two masked 8-byte loads (bytes past len are cleared); needs 16 readable bytes at p
+        a = _bzhi_u64(rd64(p), (len * 8) as u32);
+        b = _bzhi_u64(rd64(p.add(8)), (len.saturating_sub(8) * 8) as u32);
     } else {
         let mut i = 0;
         while i + 16 < len {
@@ -340,6 +330,31 @@ unsafe fn parse_dt_simd(p: *const u8) -> i64 {
         return parse_dt(p);
     };
     days * 86400 + (h * 3600 + mi * 60 + s) as i64
+}
+/// ingest_ts is always a valid F1 timestamp (rules.md), so only the digits are converted here.
+/// Falls back to the validating parser for years outside the table. Reads p[0..19].
+#[inline(always)]
+unsafe fn parse_ingest(p: *const u8) -> i64 {
+    let a = _mm_loadu_si128(p as *const __m128i);
+    let b = _mm_loadu_si128(p.add(3) as *const __m128i);
+    let da = _mm_shuffle_epi8(a, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -128, -128, -128, -128));
+    let db = _mm_shuffle_epi8(b, _mm_setr_epi8(-128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, 14, 15, -128, -128));
+    let v = _mm_subs_epu8(_mm_or_si128(da, db), _mm_set1_epi8(b'0' as i8));
+    let pr = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));
+    let y = (_mm_extract_epi16::<0>(pr) * 100 + _mm_extract_epi16::<1>(pr)) as u32;
+    let mo = _mm_extract_epi16::<2>(pr) as u32;
+    let d = _mm_extract_epi16::<3>(pr) as u32;
+    if y.wrapping_sub(2000) >= 64 || mo > 12 || d > 31 {
+        return parse_dt_simd(p);
+    }
+    let days = *DAYTAB.get_unchecked(((y - 2000) * 512 + mo * 32 + d) as usize);
+    if days == i32::MIN {
+        return parse_dt_simd(p);
+    }
+    let h = _mm_extract_epi16::<4>(pr) as i64;
+    let mi = _mm_extract_epi16::<5>(pr) as i64;
+    let s = _mm_extract_epi16::<6>(pr) as i64;
+    days as i64 * 86400 + h * 3600 + mi * 60 + s
 }
 /// Lane masks: LANES[n] keeps the top n lanes of a 16-byte vector.
 static LANES: [[u8; 16]; 17] = {
@@ -681,18 +696,29 @@ struct StrTable {
     bytes: Vec<u8>,
 }
 impl StrTable {
+    fn finish(&mut self) {}
     fn new(n: usize) -> Self {
         let cap = (n * 2 + 16).next_power_of_two();
-        StrTable { mask: cap - 1, slots: vec![(0, 0, 0, 0); cap], bytes: Vec::new() }
+        // bytes always ends with 32 zero bytes, so masked 16-byte loads of any key stay in bounds
+        StrTable { mask: cap - 1, slots: vec![(0, 0, 0, 0); cap], bytes: vec![0u8; 32] }
     }
     fn insert(&mut self, k: &[u8], v: u32) {
-        let h = unsafe { hash(k.as_ptr(), k.len()) };
+        let mut padded = [0u8; 32];
+        let h = if k.len() <= 16 {
+            padded[..k.len()].copy_from_slice(k);
+            unsafe { hash(padded.as_ptr(), k.len()) }
+        } else {
+            unsafe { hash(k.as_ptr(), k.len()) }
+        };
         let mut i = h as usize & self.mask;
         loop {
             let s = self.slots[i];
             if s.3 == 0 {
-                self.slots[i] = (h, self.bytes.len() as u32, k.len() as u32, v + 1);
+                let off = self.bytes.len() - 32;
+                self.bytes.truncate(off);
+                self.slots[i] = (h, off as u32, k.len() as u32, v + 1);
                 self.bytes.extend_from_slice(k);
+                self.bytes.extend_from_slice(&[0u8; 32]);
                 return;
             }
             if s.0 == h && &self.bytes[s.1 as usize..(s.1 + s.2) as usize] == k {
@@ -710,8 +736,19 @@ impl StrTable {
             if s.3 == 0 {
                 return None;
             }
-            if s.0 == h && s.2 as usize == len && sl(self.bytes.as_ptr().add(s.1 as usize), len) == sl(p, len) {
-                return Some(s.3 - 1);
+            if s.0 == h && s.2 as usize == len {
+                let q = self.bytes.as_ptr().add(s.1 as usize);
+                let eq = if len <= 16 {
+                    // masked 8-byte compares; both sides have at least 16 readable bytes
+                    let m0 = (len * 8) as u32;
+                    let m1 = (len.saturating_sub(8) * 8) as u32;
+                    _bzhi_u64(rd64(q) ^ rd64(p), m0) == 0 && _bzhi_u64(rd64(q.add(8)) ^ rd64(p.add(8)), m1) == 0
+                } else {
+                    sl(q, len) == sl(p, len)
+                };
+                if eq {
+                    return Some(s.3 - 1);
+                }
             }
             i = (i + 1) & self.mask;
         }
@@ -1148,44 +1185,63 @@ fn list_csv(dir: &str) -> Vec<(String, usize)> {
     v
 }
 
-/// Parse a small two-column CSV with the general dialect rules (fast path for plain lines).
-fn read_two_col(path: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+/// A small two-column CSV parsed with the general dialect rules: one padded byte buffer plus
+/// (start, len, start, len) of the two unquoted fields of every well-formed row with a non-empty first field.
+struct TwoCol {
+    data: Vec<u8>,
+    rows: Vec<(u32, u32, u32, u32)>,
+}
+impl TwoCol {
+    fn a(&self, r: usize) -> &[u8] {
+        let x = self.rows[r];
+        &self.data[x.0 as usize..(x.0 + x.1) as usize]
+    }
+    fn b(&self, r: usize) -> &[u8] {
+        let x = self.rows[r];
+        &self.data[x.2 as usize..(x.2 + x.3) as usize]
+    }
+}
+fn read_two_col(path: &str) -> TwoCol {
     let mut data = std::fs::read(path).unwrap_or_default();
     let n = data.len();
     data.extend_from_slice(&[0; 300]);
-    let mut out = Vec::new();
+    let mut rows = Vec::with_capacity(n / 12 + 1);
     let mut i = match data[..n].iter().position(|&c| c == b'\n') {
         Some(p) => p + 1,
-        None => return out,
+        None => n,
     };
     while i < n {
-        let e = data[i..n].iter().position(|&c| c == b'\n').map(|p| i + p).unwrap_or(n);
-        let line = &data[i..e];
-        let mut commas = 0;
+        // scan the line once: comma count, last comma, any quote
+        let mut j = i;
+        let mut commas = 0u32;
+        let mut cpos = 0usize;
         let mut quotes = false;
-        let mut cpos = 0;
-        for (k, &c) in line.iter().enumerate() {
+        while j < n {
+            let c = data[j];
+            if c == b'\n' {
+                break;
+            }
             if c == b',' {
                 commas += 1;
-                cpos = k;
-            } else if c == b'"' {
-                quotes = true;
+                cpos = j;
             }
+            quotes |= c == b'"';
+            j += 1;
         }
         if !quotes {
-            if commas == 1 && cpos > 0 {
-                out.push((line[..cpos].to_vec(), line[cpos + 1..].to_vec()));
+            if commas == 1 && cpos > i {
+                rows.push((i as u32, (cpos - i) as u32, (cpos + 1) as u32, (j - cpos - 1) as u32));
             }
         } else {
             let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
-            let (_, ok) = unsafe { split_slow(data.as_ptr().add(i), e - i, 2, &mut st, &mut en) };
+            let (_, ok) = unsafe { split_slow(data.as_ptr().add(i), j - i, 2, &mut st, &mut en) };
             if ok && en[0] > st[0] {
-                out.push((data[i + st[0] as usize..i + en[0] as usize].to_vec(), data[i + st[1] as usize..i + en[1] as usize].to_vec()));
+                rows.push((i as u32 + st[0], en[0] - st[0], i as u32 + st[1], en[1] - st[1]));
             }
         }
-        i = e + 1;
+        i = j + 1;
     }
-    out
+    TwoCol { data, rows }
 }
 
 fn selftest() {
@@ -1254,7 +1310,16 @@ fn selftest() {
         let p = unsafe { buf.as_ptr().add(20) };
         let a = unsafe { parse_ts(p, f.len()) };
         let b = unsafe { parse_ts_fast(p, f.len()) };
-        let c = if f.len() == 20 && f[19] == b'Z' { unsafe { (parse_dt(p), parse_dt_simd(p)) } } else { (0, 0) };
+        let c = if f.len() == 20 && f[19] == b'Z' {
+            unsafe {
+                let r = parse_dt(p);
+                let v = parse_dt_simd(p);
+                let w = if r != BAD { parse_ingest(p) } else { r };
+                (r, if v != r { v } else { w })
+            }
+        } else {
+            (0, 0)
+        };
         n += 1;
         if a != b || c.0 != c.1 {
             bad += 1;
@@ -1363,21 +1428,23 @@ fn main() {
     let camps = read_two_col(&format!("{data_dir}/campaigns.csv"));
     let mut cat_names: Vec<Vec<u8>> = Vec::new();
     let mut cat_tab = StrTable::new(64);
-    let mut prod_tab = StrTable::new(prods.len());
-    for (p, c) in &prods {
-        let mut cp = c.clone();
-        cp.extend_from_slice(&[0; 16]);
-        let ci = match unsafe { cat_tab.get(cp.as_ptr(), c.len()) } {
+    let mut prod_tab = StrTable::new(prods.rows.len());
+    prod_tab.bytes.reserve(prods.data.len());
+    for r in 0..prods.rows.len() {
+        let (p, c) = (prods.a(r), prods.b(r));
+        let ci = match unsafe { cat_tab.get(c.as_ptr(), c.len()) } {
             Some(i) => i,
             None => {
                 let i = cat_names.len() as u32;
                 cat_tab.insert(c, i);
-                cat_names.push(c.clone());
+                cat_names.push(c.to_vec());
                 i
             }
         };
         prod_tab.insert(p, ci);
     }
+    prod_tab.finish();
+    cat_tab.finish();
     let cat_unknown = cat_names.len() as u32;
     cat_names.push(b"unknown".to_vec());
     assert!(cat_names.len() <= 255, "too many categories");
@@ -1389,11 +1456,12 @@ fn main() {
     for (r, &i) in order.iter().enumerate() {
         cat_rank[i] = r as u32;
     }
-    let mut camp_tab = StrTable::new(camps.len());
-    for (i, (c, _)) in camps.iter().enumerate() {
-        camp_tab.insert(c, i as u32);
+    let mut camp_tab = StrTable::new(camps.rows.len());
+    for r in 0..camps.rows.len() {
+        camp_tab.insert(camps.a(r), r as u32);
     }
-    let ncamp = camps.len();
+    camp_tab.finish();
+    let ncamp = camps.rows.len();
     assert!(ncamp < 65535, "too many campaigns");
 
     // ---- map input files into one region
@@ -1543,7 +1611,7 @@ fn main() {
                             if abl == 2 { abl_sink += h; continue; }
                             let il = (en[3] - st[3]) as usize;
                             let ip = p.add(st[3] as usize);
-                            let ing = if il == 20 && *ip.add(19) == b'Z' { parse_dt_simd(ip) } else { BAD };
+                            let ing = if il == 20 && *ip.add(19) == b'Z' { parse_ingest(ip) } else { BAD };
                             let ing_rel = if ing == BAD { 0xFF_FFFF } else { (ing - ing_base).clamp(0, 0xFF_FFFE) as u32 };
                             let mut rec = Rec { user: 0, pp: (line as u64) << 24, eh: h, ts: INVALID, ic: ing_rel << 8 };
                             'v: {
@@ -2131,7 +2199,7 @@ fn main() {
     let (mut days, mut sess, mut purch, mut asst): (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>) = (vec![], vec![], vec![], vec![]);
     let mut revs: Vec<i64> = Vec::new();
     for c in 0..=ncamp {
-        let (id, ch): (&[u8], &[u8]) = if c == ncamp { (b"organic", b"organic") } else { (&camps[c].0, &camps[c].1) };
+        let (id, ch): (&[u8], &[u8]) = if c == ncamp { (b"organic", b"organic") } else { (camps.a(c), camps.b(c)) };
         for d in 0..nd {
             let x = tot[c * nd + d];
             if x.sessions == 0 && x.assisted == 0 {
