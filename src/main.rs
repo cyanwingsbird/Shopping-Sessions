@@ -961,7 +961,7 @@ const EVFN: bool = true;
 const DEDUPBM: bool = false;
 /// stage 3: partitions of at least SUB3MIN events are split into SUB3 pieces by person hash
 const SUB3: usize = 4;
-const SUB3MIN: usize = 32768;
+const SUB3MIN: usize = usize::MAX;
 /// stage-2 scatter: staging-slot prefetch distance (0 = none)
 const PFW: usize = 0;
 /// stage-3 grouping: hash-slot prefetch distance (0 = none)
@@ -3030,6 +3030,8 @@ struct LinkRaw {
     hb: u64,
     la: u64,
     lb: u64,
+    pa: u64, // first 8 bytes, big-endian (prefix_of), read while the line is in cache
+    pb: u64,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -3166,9 +3168,10 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
     let mut hashes: Vec<u64> = Vec::with_capacity(raw.len() * 2);
     let mut locs: Vec<u64> = Vec::with_capacity(raw.len() * 2);
     let mut parent: Vec<u32> = Vec::with_capacity(raw.len() * 2);
+    let mut prefix: Vec<u64> = Vec::with_capacity(raw.len() * 2);
     let sp = slots.as_mut_ptr();
     macro_rules! intern {
-        ($h:expr, $loc:expr) => {{
+        ($h:expr, $loc:expr, $pre:expr) => {{
             let h = $h;
             let mut i = h as usize & mask;
             loop {
@@ -3182,6 +3185,7 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
                     s.person = id as u64;
                     hashes.push(h);
                     locs.push($loc);
+                    prefix.push($pre);
                     parent.push(id);
                     break id;
                 }
@@ -3200,8 +3204,8 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
                 _mm_prefetch(sp.add(n.ha as usize & mask) as *const i8, _MM_HINT_T0);
                 _mm_prefetch(sp.add(n.hb as usize & mask) as *const i8, _MM_HINT_T0);
             }
-            let a = intern!(l.ha, l.la);
-            let b = intern!(l.hb, l.lb);
+            let a = intern!(l.ha, l.la, l.pa);
+            let b = intern!(l.hb, l.lb, l.pb);
             pairs.push((a, b));
         }
     }
@@ -3221,7 +3225,7 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
                 _mm_prefetch(sp.add(n.ha as usize & mask) as *const i8, _MM_HINT_T0);
                 _mm_prefetch(sp.add(n.hb as usize & mask) as *const i8, _MM_HINT_T0);
             }
-            (intern!(l.ha, l.la), intern!(l.hb, l.lb))
+            (intern!(l.ha, l.la, l.pa), intern!(l.hb, l.lb, l.pb))
         };
         let pp = parent.as_mut_ptr();
         let mut ra = a;
@@ -3251,7 +3255,6 @@ unsafe fn build_links(raw: &[LinkRaw]) -> LinkMap {
         let p = parent[i] as usize;
         parent[i] = parent[p];
     }
-    let prefix: Vec<u64> = locs.iter().map(|&l| prefix_of(l)).collect();
     let mut minid: Vec<u32> = (0..n as u32).collect();
     for i in 0..n {
         let r = parent[i] as usize;
@@ -4142,6 +4145,8 @@ fn main() {
                                     hb: hash(p.add(st[1] as usize), lb),
                                     la: (((s + st[0] as usize) as u64) << 24) | la as u64,
                                     lb: (((s + st[1] as usize) as u64) << 24) | lb as u64,
+                                    pa: prefix_of((((s + st[0] as usize) as u64) << 24) | la as u64),
+                                    pb: prefix_of((((s + st[1] as usize) as u64) << 24) | lb as u64),
                                 });
                             }
                             s += len + 1;
@@ -4173,6 +4178,8 @@ fn main() {
                                     hb: hash(p.add(st[1] as usize), lb),
                                     la: (((s + st[0] as usize) as u64) << 24) | la as u64,
                                     lb: (((s + st[1] as usize) as u64) << 24) | lb as u64,
+                                    pa: prefix_of((((s + st[0] as usize) as u64) << 24) | la as u64),
+                                    pb: prefix_of((((s + st[1] as usize) as u64) << 24) | lb as u64),
                                 });
                             }
                             s += len + 1;

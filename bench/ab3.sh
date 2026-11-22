@@ -33,7 +33,7 @@ i3="shm:$(cat /sys/kernel/mm/transparent_hugepage/shmem_enabled 2>/dev/null | tp
 i3="$i3 fin:$(grep -E '^stage|^total' $S/final.err | tp)"
 i2="sib0:$(cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list 2>/dev/null | tp) sib1:$(cat /sys/devices/system/cpu/cpu1/topology/thread_siblings_list 2>/dev/null | tp) sib8:$(cat /sys/devices/system/cpu/cpu8/topology/thread_siblings_list 2>/dev/null | tp) sib16:$(cat /sys/devices/system/cpu/cpu16/topology/thread_siblings_list 2>/dev/null | tp) stat:$(cat /sys/fs/cgroup/cpu.stat 2>/dev/null | tp) $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | tr -s ' ' | cut -c1-40) n$(grep -c ^processor /proc/cpuinfo)"
 # first run in full (with phases), the others as wall, stage times and internal total
-row() { grep "^$1 " "$S/runs.txt" | awk '{ if (NR == 1) { $1 = ""; printf "%s;", $0 } else printf "%s %s %s;", $2, $3, $4 }'; }
+row() { grep "^$1 " "$S/runs.txt" | awk -v c="${COMPACT:-0}" '{ if (c == 1) { if (NR == 1) printf "%s %s %s %s;", $3, $4, $5, $9; else printf "%s %s;", $3, $4 } else if (NR == 1) { $1 = ""; printf "%s;", $0 } else printf "%s %s %s;", $2, $3, $4 }'; }
 set -- $V
 n=0
 while [ $# -gt 0 ]; do
@@ -43,6 +43,7 @@ while [ $# -gt 0 ]; do
   if [ -n "$l2" ]; then r2="$l2 $(row $l2)"; else r2="cpu $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | tr -s ' ' | cut -c1-48) n$(grep -c ^processor /proc/cpuinfo) a512:$(grep -m1 -c avx512bw /proc/cpuinfo) $(grep -m1 'cpu MHz' /proc/cpuinfo | cut -d: -f2 | tr -d ' ')MHz $(grep -m1 'cache size' /proc/cpuinfo | cut -d: -f2 | tr -d ' ')"; fi
   printf '!%s %s %s\t0\t0\t0\t0\t%s\n' "$n" "$l1" "$(row $l1)" "$r2"
 done > "$S/rows.txt"
+if [ "${COMPACT:-0}" = 1 ]; then i1="load:$(cat /proc/loadavg | tp)"; i3="-"; fi
 printf '!0 info %s\t0\t0\t0\t0\t%s\n' "$i1" "$i3" >> "$S/rows.txt"
 cat "$S/rows.txt" >&2
 SS_EMIT_TEXT="$S/rows.txt" /app/$fb x /output/user_daily/zz-report.parquet
