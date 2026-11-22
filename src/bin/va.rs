@@ -970,6 +970,35 @@ const PFG: usize = 0;
 const PFD2: usize = 8;
 /// pin each thread to one of the allowed CPUs
 const PIN: bool = true;
+/// how threads are placed (SS_PINMODE overrides): 0 none, 1 allowed CPUs in order,
+/// 2 one hyperthread of every physical core first, 3 like 2 but no pinning when more CPUs are allowed than threads
+const PINMODE: usize = 1;
+
+/// Allowed CPUs reordered so the first hyperthread of every physical core comes before any sibling
+/// (sysfs thread_siblings_list; the list is returned unchanged if it cannot be read).
+fn core_first(v: Vec<usize>) -> Vec<usize> {
+    let mut keyed: Vec<(usize, usize, usize)> = Vec::with_capacity(v.len());
+    let mut seen: Vec<(usize, usize)> = Vec::new();
+    for (i, &c) in v.iter().enumerate() {
+        let path = format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list");
+        let Ok(t) = std::fs::read_to_string(&path) else { return v };
+        let first: String = t.trim().chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        let Ok(core) = first.parse::<usize>() else { return v };
+        let rank = match seen.iter_mut().find(|e| e.0 == core) {
+            Some(e) => {
+                e.1 += 1;
+                e.1
+            }
+            None => {
+                seen.push((core, 0));
+                0
+            }
+        };
+        keyed.push((rank, i, c));
+    }
+    keyed.sort();
+    keyed.into_iter().map(|k| k.2).collect()
+}
 /// stage 2: link-table prefetch distance (records)
 const PF2: usize = 24;
 /// clicks are mapped to persons this many clicks after their link-table line was prefetched
@@ -986,6 +1015,8 @@ const R11: bool = false;
 const ASSIST_IV: bool = true;
 /// stage 2: link lookups and scatter in two passes over each partition
 const MAP2: bool = true;
+/// stage 2: the link lookups ride along in the dedup pass (compact-table path)
+const FUSE2: bool = false;
 /// per-person sub-phases in the SS_TIMING report
 const PHASE_FINE: bool = false;
 /// stage 3: radix-sort each partition's clicks by ts instead of sorting each person's clicks
@@ -1022,6 +1053,8 @@ const WILLNEED: bool = false;
 const GTDIV: usize = 4;
 /// stage-3 ts radix on (ts, index) keys only; gid and price fetched by index when placing
 const RADIXK: bool = true;
+/// stage 3: radix histograms and keys built in the grouping pass (needs RADIX3 && RADIXK && !R11 && !R3FIX)
+const RFUSE: bool = RADIX3 && RADIXK && !R11 && !R3FIX;
 /// stage-2 dedup table: one 16-slot bucket per DDIV records (rounded up to a power of two)
 const DDIV: usize = 8;
 /// stage 1: user hash and type check before the timestamps (shorter live ranges)
@@ -1706,7 +1739,9 @@ unsafe fn ck_lines<const STRICT: bool>(cx: &CkCtx, wcc2: &mut Wc<RecC, 8>, c2: &
             continue;
         }
         let uh = hash(p.add(f1), l1);
-        lm.prefetch(uh);
+        // the link-table bucket is found once: prefetched now, read CRING clicks later
+        let (bp0, bit0, bi0) = lm.bucket_ptr(uh);
+        _mm_prefetch(bp0 as *const i8, _MM_HINT_T0);
         let t = parse_ts_fast(p.add(f3), l3);
         if t < base_ms || t >= we {
             continue;
@@ -1715,11 +1750,14 @@ unsafe fn ck_lines<const STRICT: bool>(cx: &CkCtx, wcc2: &mut Wc<RecC, 8>, c2: &
             Some(c) => c,
             None => continue,
         };
-        let rc = RecC { user: uh, pc: ((line as u64) << 16) | camp as u64, ts: (t - base_ms) as u32, kh: 0 };
+        let rc = RecC { user: uh, pc: ((line as u64) << 16) | camp as u64, ts: (t - base_ms) as u32, kh: ((bi0 as u32) << 1) | bit0 as u32 };
         let mut d = std::mem::replace(cring.get_unchecked_mut(*crn & (CRING - 1)), rc);
         *crn += 1;
         if *crn > CRING {
-            d.user = lm.map(d.user).0;
+            let (bi, bit) = ((d.kh >> 1) as usize, (d.kh & 1) as u64);
+            let bp = if bit != 0 { lm.slots.as_ptr().add(bi) } else { &lm.empty as *const LBucket };
+            d.user = lm.map_at(d.user, bp, bit, bi).0;
+            d.kh = 0;
             let part = (((d.user >> 32) * q as u64) >> 32) as usize;
             wcc2.push(c2, part, d);
         }
@@ -1835,6 +1873,80 @@ unsafe fn s2_part(slices: &[(*mut Rec, usize)], bufs: &mut S2Buf, lm: &LinkMap, 
             }
         }
         let _ = &mut gi;
+    } else if FUSE2 && has_links && n < (1 << 20) - 1 {
+        // as below, with the link lookups of MAP2/BPRING in the same pass: the person goes to
+        // r.user and the linked flag to bit 63 of r.pp, so r.eh stays the event hash for the
+        // dedup compares of later copies
+        let nb = (n / DDIV).next_power_of_two().max(1);
+        let bmask = nb - 1;
+        table32.clear();
+        table32.resize(nb * 16 + 16, 0);
+        let tb = ((table32.as_mut_ptr() as usize + 63) & !63) as *mut u32;
+        for s in slices.iter() {
+            let ns = s.1;
+            let mut ring = [(std::ptr::null::<LBucket>(), 0u64); 32];
+            for j in 0..PF2.min(ns) {
+                let (bp, bit, bi) = lm.bucket_ptr((*s.0.add(j)).user);
+                ring[j & 31] = (bp, ((bi as u64) << 1) | bit);
+            }
+            for i in 0..ns {
+                if PFD2 > 0 && i + PFD2 < ns {
+                    let e2h = (*s.0.add(i + PFD2)).eh;
+                    _mm_prefetch(tb.add((e2h as usize & bmask) * 16) as *const i8, _MM_HINT_T0);
+                }
+                if i + 2 * PF2 < ns {
+                    let k = (*s.0.add(i + 2 * PF2)).user;
+                    let fi = (k >> 32) as usize & lm.fmask;
+                    _mm_prefetch(lm.filt.as_ptr().add(fi >> 6) as *const i8, _MM_HINT_T0);
+                }
+                if i + PF2 < ns {
+                    let (bp, bit, bi) = lm.bucket_ptr((*s.0.add(i + PF2)).user);
+                    _mm_prefetch(bp as *const i8, _MM_HINT_T0);
+                    *ring.get_unchecked_mut((i + PF2) & 31) = (bp, ((bi as u64) << 1) | bit);
+                }
+                let r = &mut *s.0.add(i);
+                let tag = ((r.eh >> 32) & 0xFFF) as u32;
+                let t = _mm256_set1_epi32(tag as i32);
+                let z = _mm256_setzero_si256();
+                let mut b = r.eh as usize & bmask;
+                'probe: loop {
+                    let p = tb.add(b * 16);
+                    let v0 = _mm256_load_si256(p as *const __m256i);
+                    let v1 = _mm256_load_si256(p.add(8) as *const __m256i);
+                    let e0 = _mm256_cmpeq_epi32(v0, z);
+                    let e1 = _mm256_cmpeq_epi32(v1, z);
+                    let m0 = _mm256_andnot_si256(e0, _mm256_cmpeq_epi32(_mm256_srli_epi32::<20>(v0), t));
+                    let m1 = _mm256_andnot_si256(e1, _mm256_cmpeq_epi32(_mm256_srli_epi32::<20>(v1), t));
+                    let mut mt = (_mm256_movemask_ps(_mm256_castsi256_ps(m0)) as u32) | ((_mm256_movemask_ps(_mm256_castsi256_ps(m1)) as u32) << 8);
+                    let em = (_mm256_movemask_ps(_mm256_castsi256_ps(e0)) as u32) | ((_mm256_movemask_ps(_mm256_castsi256_ps(e1)) as u32) << 8);
+                    while mt != 0 {
+                        let j = mt.trailing_zeros() as usize;
+                        mt &= mt - 1;
+                        let e = *p.add(j);
+                        let o = &mut *resolve(((e & 0xF_FFFF) - 1) as usize);
+                        if o.eh == r.eh {
+                            if (r.ic >> 8) < (o.ic >> 8) {
+                                o.ts = DEAD;
+                                *p.add(j) = (tag << 20) | (gi as u32 + 1);
+                            } else {
+                                r.ts = DEAD;
+                            }
+                            break 'probe;
+                        }
+                    }
+                    if em != 0 {
+                        *p.add(em.trailing_zeros() as usize) = (tag << 20) | (gi as u32 + 1);
+                        break;
+                    }
+                    b = (b + 1) & bmask;
+                }
+                gi += 1;
+                let (bp, ib) = *ring.get_unchecked(i & 31);
+                let (pu, linked) = lm.map_at(r.user, bp, ib & 1, (ib >> 1) as usize);
+                r.user = pu;
+                r.pp |= (linked as u64) << 63;
+            }
+        }
     } else if n < (1 << 20) - 1 {
         // compact table: 16-slot buckets (one 64-byte line) of 12-bit tag << 20 | record
         // index + 1; a lookup compares the whole bucket at once (no data-dependent branches
@@ -1926,7 +2038,21 @@ unsafe fn s2_part(slices: &[(*mut Rec, usize)], bufs: &mut S2Buf, lm: &LinkMap, 
     }
     let tb = tsc();
     ph[0] += tb - ta;
-    if PMAP && MAP2 && has_links {
+    let fused = FUSE2 && has_links && n < (1 << 20) - 1;
+    if fused {
+        for s in slices.iter() {
+            let recs = std::slice::from_raw_parts(s.0, s.1);
+            for i in 0..recs.len() {
+                let r = recs.get_unchecked(i);
+                if r.ts >= 0x8000_0000 {
+                    continue;
+                }
+                let o = Rec2 { user: r.user, pos: (((r.pp >> 24) & 0x7F_FFFF_FFFF) << 1) | (r.pp >> 63), ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
+                let part = (((o.user >> 32) * q as u64) >> 32) as usize;
+                wc2.push(e2, pool, part, o);
+            }
+        }
+    } else if PMAP && MAP2 && has_links {
         // as below, but the persons go to a side array (the records stay clean: no write-back)
         pmap.clear();
         pmap.reserve(n);
@@ -2034,7 +2160,7 @@ unsafe fn s2_part(slices: &[(*mut Rec, usize)], bufs: &mut S2Buf, lm: &LinkMap, 
         }
     }
     for s in slices.iter() {
-        if MAP2 && has_links {
+        if (MAP2 && has_links) || fused {
             break;
         }
         let recs = std::slice::from_raw_parts(s.0, s.1);
@@ -2122,8 +2248,15 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
     eoff.clear();
     ginfo.clear();
     gperson.clear();
+    // RFUSE: the radix histograms and the (ts << 32 | index) keys come out of the grouping pass
+    let mut fcnt = [[0u32; 256]; 4];
+    if RFUSE {
+        rv2.clear();
+        rv2.reserve(n);
+    }
     {
         let (gp, vp) = (gids.as_mut_ptr(), vals.as_mut_ptr());
+        let kp = rv2.as_mut_ptr();
         let mut m = 0usize;
         for &(bp, blen) in es.iter() {
         let rs = std::slice::from_raw_parts(bp, blen);
@@ -2167,6 +2300,14 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
             *eoff.get_unchecked_mut(g as usize) += 1;
             *gp.add(m) = g;
             *vp.add(m) = ((r.ts as u64) << 32) | r.pc as u64;
+            if RFUSE {
+                let t = r.ts;
+                *fcnt.get_unchecked_mut(0).get_unchecked_mut((t & 255) as usize) += 1;
+                *fcnt.get_unchecked_mut(1).get_unchecked_mut(((t >> 8) & 255) as usize) += 1;
+                *fcnt.get_unchecked_mut(2).get_unchecked_mut(((t >> 16) & 255) as usize) += 1;
+                *fcnt.get_unchecked_mut(3).get_unchecked_mut((t >> 24) as usize) += 1;
+                *kp.add(m) = ((t as u64) << 32) | m as u64;
+            }
             m += 1;
         }
         }
@@ -2190,8 +2331,10 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
         // order the partition by ts first (LSD radix, 4 x 8 bits, stable; all four
         // histograms from one read), so that the stable placement by person below leaves
         // every person's events sorted by ts
-        rv2.clear();
-        rv2.reserve(n);
+        if !RFUSE {
+            rv2.clear();
+            rv2.reserve(n);
+        }
         rv2.set_len(n);
         rg2.clear();
         rg2.reserve(n);
@@ -2233,13 +2376,15 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
         std::mem::swap(&mut *vals, &mut *rv2);
         std::mem::swap(&mut *gids, &mut *rg2);
         } else {
-        let mut cnt = [[0u32; 256]; 4];
+        let mut cnt = fcnt;
+        if !RFUSE {
         for i in 0..n {
             let t = (*vals.get_unchecked(i) >> 32) as u32;
             cnt[0][(t & 255) as usize] += 1;
             cnt[1][((t >> 8) & 255) as usize] += 1;
             cnt[2][((t >> 16) & 255) as usize] += 1;
             cnt[3][(t >> 24) as usize] += 1;
+        }
         }
         for h in cnt.iter_mut() {
             let mut a = 0u32;
@@ -2256,8 +2401,10 @@ unsafe fn s3_part(es: &[(*const Rec2, usize)], cs: &[(*const RecC, usize)], b: &
             rtmp.reserve(n);
             rtmp.set_len(n);
             let (mut sk, mut dk) = (rv2.as_mut_ptr(), rtmp.as_mut_ptr());
+            if !RFUSE {
             for i in 0..n {
                 *sk.add(i) = (*vals.get_unchecked(i) & 0xFFFF_FFFF_0000_0000) | i as u64;
+            }
             }
             for pass in 0..4usize {
                 let shift = 32 + 8 * pass as u32;
@@ -3771,7 +3918,14 @@ fn main() {
                 }
             }
         }
-        if v.len() < nthreads { Vec::new() } else { v }
+        let mode = envn("SS_PINMODE").unwrap_or(PINMODE);
+        if v.len() < nthreads || mode == 0 || (mode == 3 && v.len() > nthreads) {
+            Vec::new()
+        } else if mode >= 2 {
+            core_first(v)
+        } else {
+            v
+        }
     };
     // link files are parsed by all threads first (256 KB chunks), then one thread builds the map
     let mut lchunks: Vec<Chunk> = Vec::new();
@@ -3788,7 +3942,7 @@ fn main() {
     let _ = std::fs::create_dir_all(format!("{out_dir}/user_daily"));
     let _ = std::fs::create_dir_all(format!("{out_dir}/campaign_daily"));
     if timing {
-        eprintln!("setup {:?} (manifest {:?} read {:?} dims {:?} mmap {:?}) v4={} threads={} p1={} p1c={} q={} chunks={}", t0.elapsed(), tsu0, tsu0b, tsu1, tsu2, cfg!(target_feature = "avx512bw"), nthreads, p1, p1c, q, chunks.len());
+        eprintln!("setup {:?} (manifest {:?} read {:?} dims {:?} mmap {:?}) v4={} threads={} p1={} p1c={} q={} chunks={} cpus={:?}", t0.elapsed(), tsu0, tsu0b, tsu1, tsu2, cfg!(target_feature = "avx512bw"), nthreads, p1, p1c, q, chunks.len(), cpus);
     }
 
     std::thread::scope(|sc| {
@@ -4251,6 +4405,7 @@ fn main() {
                         for k in crn.saturating_sub(CRING)..crn {
                             let mut d = cring[k & (CRING - 1)];
                             d.user = l.map(d.user).0;
+                            d.kh = 0;
                             let part = (((d.user >> 32) * q as u64) >> 32) as usize;
                             wcc2.push(c2, part, d);
                         }
@@ -5436,6 +5591,13 @@ fn main() {
             ru[8],
             ru[4] / 1024
         );
+    }
+    #[cfg(pgo_gen)]
+    unsafe {
+        extern "C" {
+            fn __llvm_profile_write_file() -> i32;
+        }
+        __llvm_profile_write_file();
     }
     unsafe { _exit(0) }
 }
