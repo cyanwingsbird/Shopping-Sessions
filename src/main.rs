@@ -1320,6 +1320,65 @@ unsafe fn split_long<const NF: usize>(p: *const u8, maxlen: usize, st: &mut [u32
     }
     (0, len as usize)
 }
+/// Event line whose first three fields run past the first 64 bytes (a long ID): the third comma is
+/// looked for in bytes 64..128, then the line is finished like split_ev7f (64-byte window after the
+/// third comma). Same generator-exact rules; fields go to st/en with quotes stripped.
+/// Returns (kind, length): 0 ok, 1 malformed, 2 needs another splitter.
+#[inline(always)]
+unsafe fn split_ev7l(p: *const u8, maxlen: usize, st: &mut [u32; 8], en: &mut [u32; 8]) -> (u32, usize) {
+    let (n0, c0, q0) = masks64(p);
+    if n0 != 0 || c0.count_ones() >= 3 {
+        return (2, 0);
+    }
+    let (n1, c1, q1) = masks64(p.add(64));
+    let mut cp = [0u32; 3];
+    let mut i = 0usize;
+    let mut m = c0;
+    while m != 0 {
+        *cp.get_unchecked_mut(i) = m.trailing_zeros();
+        i += 1;
+        m &= m - 1;
+    }
+    let mut m = c1;
+    while i < 3 {
+        if m == 0 {
+            return (2, 0);
+        }
+        *cp.get_unchecked_mut(i) = 64 + m.trailing_zeros();
+        i += 1;
+        m &= m - 1;
+    }
+    let c2 = cp[2];
+    let below = _bzhi_u64(!0u64, c2 - 64);
+    if n1 & below != 0 {
+        return (2, 0);
+    }
+    let b0 = c2 + 1;
+    let (nb, cb, qb) = masks64(p.add(b0 as usize));
+    let e = nb.trailing_zeros();
+    let len = b0 + e;
+    if nb == 0 || len as usize > maxlen {
+        return (2, 0);
+    }
+    let me = _bzhi_u64(!0u64, e);
+    let cbm = cb & me;
+    let qn = q0.count_ones() + (q1 & below).count_ones() + (qb & me).count_ones();
+    if cbm.count_ones() != 3 || (qn & 1) != 0 {
+        return (1, len as usize);
+    }
+    let d1 = cbm & cbm.wrapping_sub(1);
+    let d2 = d1 & d1.wrapping_sub(1);
+    let ends = [cp[0], cp[1], c2, b0 + cbm.trailing_zeros(), b0 + d1.trailing_zeros(), b0 + d2.trailing_zeros(), len];
+    let mut s0 = 0u32;
+    for k in 0..7 {
+        let x = ends[k];
+        let f = (x > s0 && *p.add(s0 as usize) == b'"') as u32;
+        *st.get_unchecked_mut(k) = s0 + f;
+        *en.get_unchecked_mut(k) = x - f;
+        s0 = x + 1;
+    }
+    (0, len as usize)
+}
 /// process CPU so far for the timing lines: k<sys ms>f<minor faults>
 fn rus() -> String {
     let mut ru = [0i64; 18];
@@ -1739,7 +1798,10 @@ unsafe fn ev_lines<const STRICT: bool>(cx: &EvCtx, wc1: &mut Wc<Rec, WC1K>, evb:
                 continue;
             }
             if LONGSP && !strict {
-                let (k, l) = split_long::<7>(p, c.fe - line_at, &mut st, &mut en);
+                let (mut k, mut l) = split_ev7l(p, c.fe - line_at, &mut st, &mut en);
+                if k == 2 {
+                    (k, l) = split_long::<7>(p, c.fe - line_at, &mut st, &mut en);
+                }
                 if k == 0 {
                     s = line_at + l + 1;
                     let fld = |k: usize| -> (usize, usize) { (st[k] as usize, (en[k] - st[k]) as usize) };
@@ -3843,6 +3905,8 @@ fn main() {
     let envn = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
     let repeat = envn("SS_REPEAT").unwrap_or(1);
     let stop = envn("SS_STOP").unwrap_or(9);
+    let sub3 = envn("SS_SUB3").unwrap_or(SUB3).next_power_of_two().clamp(1, 64);
+    let sub3min = envn("SS_SUB3MIN").unwrap_or(SUB3MIN);
     let nthreads = envn("SS_THREADS")
         .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
         .or(envn("NCPU"))
@@ -4891,8 +4955,8 @@ fn main() {
                 let mut cgids: Vec<u32> = Vec::new();
                 let mut ctmp: Vec<(u32, u32, u64)> = Vec::new();
                 let mut ctmp2: Vec<(u32, u32, u64)> = Vec::new();
-                let mut sbe: Vec<Vec<Rec2>> = (0..SUB3).map(|_| Vec::new()).collect();
-                let mut sbc: Vec<Vec<RecC>> = (0..SUB3).map(|_| Vec::new()).collect();
+                let mut sbe: Vec<Vec<Rec2>> = (0..sub3).map(|_| Vec::new()).collect();
+                let mut sbc: Vec<Vec<RecC>> = (0..sub3).map(|_| Vec::new()).collect();
                 let mut cg2: Vec<u32> = Vec::new();
                 let mut eoff: Vec<u32> = Vec::new();
                 let mut coff: Vec<u32> = Vec::new();
@@ -4936,7 +5000,7 @@ fn main() {
                     }
                     let call: Vec<(*const RecC, usize)> = (0..nthreads).map(|t| (ck2[t].get()[qi].as_ptr(), ck2[t].get()[qi].len())).collect();
                     // big partitions: split by person hash first, so that each piece's working set stays in L2
-                    let nsub = if ntot >= SUB3MIN { SUB3 } else { 1 };
+                    let nsub = if ntot >= sub3min { sub3 } else { 1 };
                     if nsub > 1 {
                         for v in sbe.iter_mut() {
                             v.clear();
@@ -4946,12 +5010,12 @@ fn main() {
                         }
                         for &(p, l) in &eall {
                             for r in std::slice::from_raw_parts(p, l) {
-                                sbe.get_unchecked_mut(r.user as usize & (SUB3 - 1)).push(*r);
+                                sbe.get_unchecked_mut(r.user as usize & (sub3 - 1)).push(*r);
                             }
                         }
                         for &(p, l) in &call {
                             for r in std::slice::from_raw_parts(p, l) {
-                                sbc.get_unchecked_mut(r.user as usize & (SUB3 - 1)).push(*r);
+                                sbc.get_unchecked_mut(r.user as usize & (sub3 - 1)).push(*r);
                             }
                         }
                     }
