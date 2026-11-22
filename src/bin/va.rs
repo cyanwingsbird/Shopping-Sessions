@@ -1004,7 +1004,7 @@ const PF2: usize = 24;
 /// clicks are mapped to persons this many clicks after their link-table line was prefetched
 const CRING: usize = 8;
 /// SS_ABL ablations (diagnostic builds only)
-const DIAG: bool = false;
+const DIAG: bool = true;
 /// records per partition staged before a streaming write in stage 1 (32-byte records)
 const WC1K: usize = 4;
 /// stage-2 output blocks recycled from consumed stage-1 memory
