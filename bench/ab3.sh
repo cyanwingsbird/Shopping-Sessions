@@ -17,9 +17,9 @@ one() {
   r=$(env SS_TIMING=1 $envs /app/$bin "$S/gen" "$S/out" 2>&1 | awk '
     function ms(x) { if (x ~ /ms$/) { sub(/ms$/, "", x); return x + 0 } if (x ~ /µs$/) return 0; sub(/s$/, "", x); return x * 1000 }
     /^stage1/ { s1 = ms($3); r1 = $5 } /^stage2/ { s2 = ms($3); r2 = $5 } /^stage3/ { s3 = ms($3); r3 = $5 } /^total/ { tt = ms($2); us = $4; sy = $6; fl = $8 }
-    /^links done/ { li = ms($3) }
+    /^links done/ { li = ms($3) } /^digest/ { dg = substr($2, 11) }
     /^phases/ { for (i = 3; i <= NF; i++) { split($i, kv, "="); if (kv[2] != "" && kv[2] != "0") ph = ph substr(kv[1], 1, 2) kv[2] "," } }
-    END { printf "%.0f/%.0f/%.0f t%.0f l%.0f u%s s%s %s %s/%s/%s/f%s", s1, s2 - s1, s3 - s2, tt, li, us, sy, ph, r1, r2, r3, fl }')
+    END { printf "%.0f/%.0f/%.0f t%.0f l%.0f u%s s%s %s %s/%s/%s/f%s", s1, s2 - s1, s3 - s2, tt, li, us, sy, ph, r1, r2, r3, fl dg }')
   b=$(date +%s%N)
   echo "$label w$(( (b - a) / 1000000 )) $r" >> "$S/runs.txt"
 }

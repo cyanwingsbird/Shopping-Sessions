@@ -12,5 +12,5 @@ COPY --from=build /src/target/release/va /src/target/release/vb /app/
 COPY --from=build /gen/target/release/generate /app/generate
 COPY bench/ab3.sh /app/ab3.sh
 USER 1000:1000
-ENV BENCH_EVENTS=60000000 REPS=3 COMPACT=1 VARIANTS="a:va b:vb c:va:SS_SUB3MIN=100000000 d:va e:vb f:va:SS_SUB3MIN=100000000"
+ENV BENCH_EVENTS=60000000 REPS=2 COMPACT=1 VARIANTS="a:va b:vb c:vb:SS_STRICT=1 d:va e:vb f:vb:SS_THREADS=5"
 CMD ["/bin/sh", "/app/ab3.sh"]

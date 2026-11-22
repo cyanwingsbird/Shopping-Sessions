@@ -1379,6 +1379,18 @@ unsafe fn split_ev7l(p: *const u8, maxlen: usize, st: &mut [u32; 8], en: &mut [u
     }
     (0, len as usize)
 }
+/// Order-independent digest of the output rows (SS_TIMING only): the sum of one hash per row.
+static DIGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn dg_bytes(mut h: u64, b: &[u8]) -> u64 {
+    for &x in b {
+        h = (h ^ x as u64).wrapping_mul(0x100_0000_01B3);
+    }
+    h ^ (h >> 29)
+}
+fn dg_mix(h: u64, v: u64) -> u64 {
+    let x = (h ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^ (x >> 32)
+}
 /// process CPU so far for the timing lines: k<sys ms>f<minor faults>
 fn rus() -> String {
     let mut ru = [0i64; 18];
@@ -5581,6 +5593,24 @@ fn main() {
                     write_parquet(&format!("{out_dir}/user_daily/part-{tid}.parquet"), rows, &cols);
                     if timing {
                         eprintln!("write t{} {} rows {:?} at {:?}", tid, rows, tw.elapsed(), t0.elapsed());
+                        let (mut np, mut cp) = (0usize, 0usize);
+                        let mut sum = 0u64;
+                        for i in 0..rows {
+                            let nl = u32::from_le_bytes(out.names[np..np + 4].try_into().unwrap()) as usize;
+                            let mut h = dg_bytes(0xCBF2_9CE4_8422_2325, &out.names[np + 4..np + 4 + nl]);
+                            np += 4 + nl;
+                            h = dg_mix(h, out.day[i] as u64);
+                            h = dg_mix(h, out.sessions[i] as u64);
+                            h = dg_mix(h, out.events[i] as u64);
+                            h = dg_mix(h, out.rev[i] as u64);
+                            if out.def[i] != 0 {
+                                let cl = u32::from_le_bytes(out.cats[cp..cp + 4].try_into().unwrap()) as usize;
+                                h = dg_mix(h, dg_bytes(7, &out.cats[cp + 4..cp + 4 + cl]));
+                                cp += 4 + cl;
+                            }
+                            sum = sum.wrapping_add(h);
+                        }
+                        DIGEST.fetch_add(sum, Relaxed);
                     }
                 }
                 std::mem::forget(out);
@@ -5671,6 +5701,19 @@ fn main() {
     ];
     write_parquet(&format!("{out_dir}/campaign_daily/part-0.parquet"), days.len(), &cols);
     if timing {
+        let mut ip = 0usize;
+        let mut sum = 0u64;
+        for i in 0..days.len() {
+            let il = u32::from_le_bytes(ids[ip..ip + 4].try_into().unwrap()) as usize;
+            let mut h = dg_bytes(0x1234_5678_9ABC_DEF1, &ids[ip + 4..ip + 4 + il]);
+            ip += 4 + il;
+            for v in [days[i] as u64, sess[i] as u64, purch[i] as u64, revs[i] as u64, asst[i] as u64] {
+                h = dg_mix(h, v);
+            }
+            sum = sum.wrapping_add(h);
+        }
+        DIGEST.fetch_add(sum, Relaxed);
+        eprintln!("digest {:016x} rows {}", DIGEST.load(Relaxed), days.len());
         eprintln!("campaign written {:?}", t0.elapsed());
     }
     if LEAK && ev_bytes > (300usize << 20) {
