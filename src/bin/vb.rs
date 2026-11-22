@@ -1015,6 +1015,8 @@ const R11: bool = false;
 const ASSIST_IV: bool = true;
 /// stage 2: link lookups and scatter in two passes over each partition
 const MAP2: bool = true;
+/// events and clicks: lines too long for the window splitters take a three-block SIMD splitter
+const LONGSP: bool = true;
 /// stage 2: the link lookups ride along in the dedup pass (compact-table path)
 const FUSE2: bool = false;
 /// per-person sub-phases in the SS_TIMING report
@@ -1263,6 +1265,66 @@ unsafe fn fldq(p: *const u8, st: &[u32; 8], en: &[u32; 8], k: usize, quoted: boo
     // an empty field's first byte is its separator, never a quote, so no length check is needed
     let f = (quoted & (*p.add(s as usize) == b'"')) as u32;
     ((s + f) as usize, (e - s - 2 * f) as usize)
+}
+/// Lines too long for the one- and two-window splitters (IDs with a 32-character suffix): the same
+/// generator-exact rules (field count, quote parity; a field that starts with a quote is quoted) over
+/// up to three 64-byte blocks. Returns (kind, length): 0 fields in st/en with quotes stripped,
+/// 1 malformed, 2 needs the general splitter (longer line, or the file ends first).
+#[inline(always)]
+unsafe fn split_long<const NF: usize>(p: *const u8, maxlen: usize, st: &mut [u32; 8], en: &mut [u32; 8]) -> (u32, usize) {
+    let mut cpos = [0u32; 8];
+    let mut nc = 0usize;
+    let mut qn = 0u32;
+    let mut off = 0u32;
+    let len;
+    loop {
+        let (n, c, q) = masks64(p.add(off as usize));
+        let e = n.trailing_zeros();
+        let m = if n != 0 { _bzhi_u64(!0u64, e) } else { !0u64 };
+        let mut cm = c & m;
+        qn += (q & m).count_ones();
+        if nc + cm.count_ones() as usize > NF - 1 {
+            // too many fields: malformed once the line end is known
+            if n != 0 && (off + e) as usize <= maxlen {
+                return (1, (off + e) as usize);
+            }
+            return (2, 0);
+        }
+        while cm != 0 {
+            *cpos.get_unchecked_mut(nc) = off + cm.trailing_zeros();
+            nc += 1;
+            cm &= cm - 1;
+        }
+        if n != 0 {
+            len = off + e;
+            break;
+        }
+        off += 64;
+        if off >= 192 {
+            return (2, 0);
+        }
+    }
+    if len as usize > maxlen {
+        return (2, 0);
+    }
+    if nc != NF - 1 || (qn & 1) != 0 {
+        return (1, len as usize);
+    }
+    let mut s0 = 0u32;
+    for k in 0..NF {
+        let x = if k < NF - 1 { *cpos.get_unchecked(k) } else { len };
+        let f = (x > s0 && *p.add(s0 as usize) == b'"') as u32;
+        *st.get_unchecked_mut(k) = s0 + f;
+        *en.get_unchecked_mut(k) = x - f;
+        s0 = x + 1;
+    }
+    (0, len as usize)
+}
+/// process CPU so far for the timing lines: k<sys ms>f<minor faults>
+fn rus() -> String {
+    let mut ru = [0i64; 18];
+    unsafe { getrusage(0, &mut ru) };
+    format!("k{}f{}", ru[2] * 1000 + ru[3] / 1000, ru[8])
 }
 /// Events/clicks splitter dispatch: generator-exact fast path, or the general one under SS_STRICT.
 #[inline(always)]
@@ -1676,6 +1738,19 @@ unsafe fn ev_lines<const STRICT: bool>(cx: &EvCtx, wc1: &mut Wc<Rec, WC1K>, evb:
                 s = line_at + sp.len as usize + 1;
                 continue;
             }
+            if LONGSP && !strict {
+                let (k, l) = split_long::<7>(p, c.fe - line_at, &mut st, &mut en);
+                if k == 0 {
+                    s = line_at + l + 1;
+                    let fld = |k: usize| -> (usize, usize) { (st[k] as usize, (en[k] - st[k]) as usize) };
+                    ev_body!(p, line_at, fld);
+                    continue;
+                }
+                if k == 1 {
+                    s = line_at + l + 1;
+                    continue;
+                }
+            }
             let (l, ok) = if strict {
                 splitn::<7>(p, c.fe - line_at, &mut st, &mut en)
             } else {
@@ -1712,14 +1787,10 @@ struct CkCtx<'a> {
     we: i64,
     q: usize,
     strict: bool,
-    abl: u32,
 }
 #[inline(never)]
 unsafe fn ck_lines<const STRICT: bool>(cx: &CkCtx, wcc2: &mut Wc<RecC, 8>, c2: &mut [Vec<RecC>], cring: &mut [RecC; CRING], crn: &mut usize, mut s: usize, cb: usize, fe: usize) {
-    let CkCtx { camp_tab, camp_short, lm, base_ms, we, q, abl, .. } = *cx;
-    if abl == 2 {
-        return;
-    }
+    let CkCtx { camp_tab, camp_short, lm, base_ms, we, q, .. } = *cx;
     let strict = STRICT;
     let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
     while s < cb {
@@ -1733,10 +1804,20 @@ unsafe fn ck_lines<const STRICT: bool>(cx: &CkCtx, wcc2: &mut Wc<RecC, 8>, c2: &
             s = line + sp.len as usize + 1;
             continue;
         } else {
-            let (len, r) = split_ev::<4>(strict, p, fe - line, &mut st, &mut en);
-            s = line + len + 1;
-            let qd = r == 2;
-            (r, [fldq(p, &st, &en, 0, qd), fldq(p, &st, &en, 1, qd), fldq(p, &st, &en, 2, qd), fldq(p, &st, &en, 3, qd)])
+            let (k, l) = if LONGSP && !strict { split_long::<4>(p, fe - line, &mut st, &mut en) } else { (2, 0) };
+            if k == 1 {
+                s = line + l + 1;
+                continue;
+            }
+            if k == 0 {
+                s = line + l + 1;
+                (1u32, [fldq(p, &st, &en, 0, false), fldq(p, &st, &en, 1, false), fldq(p, &st, &en, 2, false), fldq(p, &st, &en, 3, false)])
+            } else {
+                let (len, r) = split_ev::<4>(strict, p, fe - line, &mut st, &mut en);
+                s = line + len + 1;
+                let qd = r == 2;
+                (r, [fldq(p, &st, &en, 0, qd), fldq(p, &st, &en, 1, qd), fldq(p, &st, &en, 2, qd), fldq(p, &st, &en, 3, qd)])
+            }
         };
         let ((_f0, l0), (f1, l1), (f2, l2), (f3, l3)) = (fs[0], fs[1], fs[2], fs[3]);
         if r == 0 || l0 == 0 || l1 == 0 {
@@ -1744,10 +1825,8 @@ unsafe fn ck_lines<const STRICT: bool>(cx: &CkCtx, wcc2: &mut Wc<RecC, 8>, c2: &
         }
         let uh = hash(p.add(f1), l1);
         // the link-table bucket is found once: prefetched now, read CRING clicks later
-        let (bp0, bit0, bi0) = if abl == 1 { (std::ptr::null(), 0u64, 0usize) } else { lm.bucket_ptr(uh) };
-        if abl != 1 {
-            _mm_prefetch(bp0 as *const i8, _MM_HINT_T0);
-        }
+        let (bp0, bit0, bi0) = lm.bucket_ptr(uh);
+        _mm_prefetch(bp0 as *const i8, _MM_HINT_T0);
         let t = parse_ts_fast(p.add(f3), l3);
         if t < base_ms || t >= we {
             continue;
@@ -1760,11 +1839,9 @@ unsafe fn ck_lines<const STRICT: bool>(cx: &CkCtx, wcc2: &mut Wc<RecC, 8>, c2: &
         let mut d = std::mem::replace(cring.get_unchecked_mut(*crn & (CRING - 1)), rc);
         *crn += 1;
         if *crn > CRING {
-            if abl != 1 {
-                let (bi, bit) = ((d.kh >> 1) as usize, (d.kh & 1) as u64);
-                let bp = if bit != 0 { lm.slots.as_ptr().add(bi) } else { &lm.empty as *const LBucket };
-                d.user = lm.map_at(d.user, bp, bit, bi).0;
-            }
+            let (bi, bit) = ((d.kh >> 1) as usize, (d.kh & 1) as u64);
+            let bp = if bit != 0 { lm.slots.as_ptr().add(bi) } else { &lm.empty as *const LBucket };
+            d.user = lm.map_at(d.user, bp, bit, bi).0;
             d.kh = 0;
             let part = (((d.user >> 32) * q as u64) >> 32) as usize;
             wcc2.push(c2, part, d);
@@ -4344,7 +4421,7 @@ fn main() {
                                     l
                                 }
                             };
-                            let cx = CkCtx { camp_tab, camp_short, lm: l, base_ms, we, q, strict, abl: std::env::var("SS_ABLCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0) };
+                            let cx = CkCtx { camp_tab, camp_short, lm: l, base_ms, we, q, strict };
                             if strict {
                                 ck_lines::<true>(&cx, &mut wcc2, c2, &mut cring, &mut crn, s, c.b, c.fe);
                             } else {
@@ -4423,7 +4500,7 @@ fn main() {
                 perf.stage(0);
                 barrier.wait();
                 if timing && tid == 0 {
-                    eprintln!("stage1 done {:?} {}", t0.elapsed(), abl_sink);
+                    eprintln!("stage1 done {:?} {} {}", t0.elapsed(), abl_sink, rus());
                 }
                 if stop == 1 {
                     _exit(0);
@@ -4794,7 +4871,7 @@ fn main() {
                 perf.stage(1);
                 barrier.wait();
                 if timing && tid == 0 {
-                    eprintln!("stage2 done {:?} {}", t0.elapsed(), abl_sink);
+                    eprintln!("stage2 done {:?} {} {}", t0.elapsed(), abl_sink, rus());
                 }
                 if stop == 2 {
                     _exit(0);
@@ -5412,7 +5489,7 @@ fn main() {
                     PHASE[i].fetch_add(*v, Relaxed);
                 }
                 if timing && tid == 0 {
-                    eprintln!("stage3 done {:?}", t0.elapsed());
+                    eprintln!("stage3 done {:?} 0 {}", t0.elapsed(), rus());
                 }
                 // ---- write this thread's user_daily file
                 let rows = out.day.len();

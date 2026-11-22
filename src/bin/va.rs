@@ -1264,6 +1264,11 @@ unsafe fn fldq(p: *const u8, st: &[u32; 8], en: &[u32; 8], k: usize, quoted: boo
     let f = (quoted & (*p.add(s as usize) == b'"')) as u32;
     ((s + f) as usize, (e - s - 2 * f) as usize)
 }
+fn rus() -> String {
+    let mut ru = [0i64; 18];
+    unsafe { getrusage(0, &mut ru) };
+    format!("k{}f{}", ru[2] * 1000 + ru[3] / 1000, ru[8])
+}
 /// Events/clicks splitter dispatch: generator-exact fast path, or the general one under SS_STRICT.
 #[inline(always)]
 unsafe fn split_ev<const NF: usize>(strict: bool, p: *const u8, maxlen: usize, st: &mut [u32; 8], en: &mut [u32; 8]) -> (usize, u32) {
@@ -4415,7 +4420,7 @@ fn main() {
                 perf.stage(0);
                 barrier.wait();
                 if timing && tid == 0 {
-                    eprintln!("stage1 done {:?} {}", t0.elapsed(), abl_sink);
+                    eprintln!("stage1 done {:?} {} {}", t0.elapsed(), abl_sink, rus());
                 }
                 if stop == 1 {
                     _exit(0);
@@ -4786,7 +4791,7 @@ fn main() {
                 perf.stage(1);
                 barrier.wait();
                 if timing && tid == 0 {
-                    eprintln!("stage2 done {:?} {}", t0.elapsed(), abl_sink);
+                    eprintln!("stage2 done {:?} {} {}", t0.elapsed(), abl_sink, rus());
                 }
                 if stop == 2 {
                     _exit(0);
@@ -5404,7 +5409,7 @@ fn main() {
                     PHASE[i].fetch_add(*v, Relaxed);
                 }
                 if timing && tid == 0 {
-                    eprintln!("stage3 done {:?}", t0.elapsed());
+                    eprintln!("stage3 done {:?} 0 {}", t0.elapsed(), rus());
                 }
                 // ---- write this thread's user_daily file
                 let rows = out.day.len();
