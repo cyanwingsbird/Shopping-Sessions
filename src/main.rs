@@ -1914,7 +1914,7 @@ unsafe fn ck_lines<const STRICT: bool>(cx: &CkCtx, wcc2: &mut Wc<RecC, 8>, c2: &
         *crn += 1;
         if *crn > CRING {
             let (bi, bit) = ((d.kh >> 1) as usize, (d.kh & 1) as u64);
-            let bp = if bit != 0 { lm.slots.as_ptr().add(bi) } else { &lm.empty as *const LBucket };
+            let bp = std::hint::select_unpredictable(bit != 0, lm.slots.as_ptr().add(bi), &lm.empty as *const LBucket);
             d.user = lm.map_at(d.user, bp, bit, bi).0;
             d.kh = 0;
             let part = (((d.user >> 32) * q as u64) >> 32) as usize;
@@ -3085,7 +3085,8 @@ impl LinkMap {
         let fi = (k >> 32) as usize & self.fmask;
         let bit = if LFILT { (*self.filt.get_unchecked(fi >> 6) >> (fi & 63)) & 1 } else { 1 };
         let i = self.bucket(k);
-        let p = if bit != 0 { self.slots.as_ptr().add(i) } else { &self.empty as *const LBucket };
+        // whether a user is in the table is unpredictable: no branch
+        let p = std::hint::select_unpredictable(bit != 0, self.slots.as_ptr().add(i), &self.empty as *const LBucket);
         (p, bit, i)
     }
     #[inline(always)]
