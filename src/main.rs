@@ -1017,24 +1017,6 @@ const ASSIST_IV: bool = true;
 const MAP2: bool = true;
 /// stage 2: the link lookups ride along in the dedup pass (compact-table path)
 const FUSE2: bool = false;
-/// stage 1: events parsed after the links are ready get their person right away (bucket prefetched,
-/// read ERING events later), so stage 2 skips their lookup. Marked in Rec.pp: bit 63 = mapped,
-/// bit 62 = linked; the line position is bits 24..62.
-const EMAP: bool = true;
-const ERING: usize = 16;
-const PP_MAPPED: u64 = 1 << 63;
-const PP_LINKED: u64 = 1 << 62;
-const LINEMASK: u64 = (1 << 38) - 1;
-const _: () = assert!(!(FUSE2 && EMAP));
-/// person of a ring entry (bucket info db = bucket << 1 | filter bit), with the flags in pp
-#[inline(always)]
-unsafe fn emap(lm: &LinkMap, d: &mut Rec, db: u64) {
-    let (bi, bit) = ((db >> 1) as usize, db & 1);
-    let bp = if bit != 0 { lm.slots.as_ptr().add(bi) } else { &lm.empty as *const LBucket };
-    let (pu, linked) = lm.map_at(d.user, bp, bit, bi);
-    d.user = pu;
-    d.pp |= PP_MAPPED | ((linked as u64) << 62);
-}
 /// per-person sub-phases in the SS_TIMING report
 const PHASE_FINE: bool = false;
 /// stage 3: radix-sort each partition's clicks by ts instead of sorting each person's clicks
@@ -1588,7 +1570,7 @@ struct EvCtx<'a> {
     strict: bool,
 }
 #[inline(never)]
-unsafe fn ev_lines<const STRICT: bool>(cx: &EvCtx, wc1: &mut Wc<Rec, WC1K>, evb: &mut [Vec<Rec>], mut s: usize, cb: usize, fe: usize, lmo: Option<&LinkMap>, ering: &mut [Rec; ERING], eringb: &mut [u64; ERING], ern: &mut usize) {
+unsafe fn ev_lines<const STRICT: bool>(cx: &EvCtx, wc1: &mut Wc<Rec, WC1K>, evb: &mut [Vec<Rec>], mut s: usize, cb: usize, fe: usize) {
     let EvCtx { prod_tab, cat_unknown, ws, we, ing_base, base_ms, p1, .. } = *cx;
     let strict = STRICT;
     let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
@@ -1672,28 +1654,7 @@ unsafe fn ev_lines<const STRICT: bool>(cx: &EvCtx, wc1: &mut Wc<Rec, WC1K>, evb:
         }
         let part = (((h >> 32) * p1 as u64) >> 32) as usize;
         if DIAG && abl == 3 { abl_sink += rec.user + rec.ts as u64; continue; }
-        match lmo {
-            Some(lm) if EMAP => {
-                if rec.ts == INVALID {
-                    // never reaches stage 3: no person needed
-                    rec.pp |= PP_MAPPED;
-                    wc1.push(evb, part, rec);
-                } else {
-                    let (bp, bit, bi) = lm.bucket_ptr(rec.user);
-                    _mm_prefetch(bp as *const i8, _MM_HINT_T0);
-                    let k = *ern & (ERING - 1);
-                    let mut d = std::mem::replace(ering.get_unchecked_mut(k), rec);
-                    let db = std::mem::replace(eringb.get_unchecked_mut(k), ((bi as u64) << 1) | bit);
-                    *ern += 1;
-                    if *ern > ERING {
-                        emap(lm, &mut d, db);
-                        let dpart = (((d.eh >> 32) * p1 as u64) >> 32) as usize;
-                        wc1.push(evb, dpart, d);
-                    }
-                }
-            }
-            _ => wc1.push(evb, part, rec),
-        }
+        wc1.push(evb, part, rec);
         };
     }
                         if !SCANNL {
@@ -2125,7 +2086,7 @@ unsafe fn s2_part(slices: &[(*mut Rec, usize)], bufs: &mut S2Buf, lm: &LinkMap, 
                 if r.ts >= 0x8000_0000 {
                     continue;
                 }
-                let o = Rec2 { user: *pm.add(k0 + i), pos: (((r.pp >> 24) & LINEMASK) << 1) | *pk.add(k0 + i) as u64, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
+                let o = Rec2 { user: *pm.add(k0 + i), pos: ((r.pp >> 24) << 1) | *pk.add(k0 + i) as u64, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
                 let part = (((o.user >> 32) * q as u64) >> 32) as usize;
                 wc2.push(e2, pool, part, o);
             }
@@ -2147,27 +2108,17 @@ unsafe fn s2_part(slices: &[(*mut Rec, usize)], bufs: &mut S2Buf, lm: &LinkMap, 
                 }
                 for i in 0..n {
                     if i + 2 * PF2 < n {
-                        let rr = recs.get_unchecked(i + 2 * PF2);
-                        if !EMAP || rr.pp & PP_MAPPED == 0 {
-                            let fi = (rr.user >> 32) as usize & lm.fmask;
-                            _mm_prefetch(lm.filt.as_ptr().add(fi >> 6) as *const i8, _MM_HINT_T0);
-                        }
+                        let k = recs.get_unchecked(i + 2 * PF2).user;
+                        let fi = (k >> 32) as usize & lm.fmask;
+                        _mm_prefetch(lm.filt.as_ptr().add(fi >> 6) as *const i8, _MM_HINT_T0);
                     }
                     if i + PF2 < n {
-                        let rr = recs.get_unchecked(i + PF2);
-                        if !EMAP || rr.pp & PP_MAPPED == 0 {
-                            let (bp, bit, bi) = lm.bucket_ptr(rr.user);
-                            _mm_prefetch(bp as *const i8, _MM_HINT_T0);
-                            *ring.get_unchecked_mut((i + PF2) & 31) = (bp, ((bi as u64) << 1) | bit);
-                        }
-                    }
-                    let r = recs.get_unchecked_mut(i);
-                    if EMAP && r.pp & PP_MAPPED != 0 {
-                        r.eh = r.user;
-                        r.user = (r.pp >> 62) & 1;
-                        continue;
+                        let (bp, bit, bi) = lm.bucket_ptr(recs.get_unchecked(i + PF2).user);
+                        _mm_prefetch(bp as *const i8, _MM_HINT_T0);
+                        *ring.get_unchecked_mut((i + PF2) & 31) = (bp, ((bi as u64) << 1) | bit);
                     }
                     let (bp, ib) = *ring.get_unchecked(i & 31);
+                    let r = recs.get_unchecked_mut(i);
                     let (pu, linked) = lm.map_at(r.user, bp, ib & 1, (ib >> 1) as usize);
                     r.eh = pu;
                     r.user = linked as u64;
@@ -2185,11 +2136,6 @@ unsafe fn s2_part(slices: &[(*mut Rec, usize)], bufs: &mut S2Buf, lm: &LinkMap, 
                     lm.prefetch(recs.get_unchecked(i + PF2).user);
                 }
                 let r = recs.get_unchecked_mut(i);
-                if EMAP && r.pp & PP_MAPPED != 0 {
-                    r.eh = r.user;
-                    r.user = (r.pp >> 62) & 1;
-                    continue;
-                }
                 let (pu, linked) = lm.map(r.user);
                 r.eh = pu;
                 r.user = linked as u64;
@@ -2206,7 +2152,7 @@ unsafe fn s2_part(slices: &[(*mut Rec, usize)], bufs: &mut S2Buf, lm: &LinkMap, 
                 if r.ts >= 0x8000_0000 {
                     continue;
                 }
-                let o = Rec2 { user: r.eh, pos: (((r.pp >> 24) & LINEMASK) << 1) | r.user, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
+                let o = Rec2 { user: r.eh, pos: ((r.pp >> 24) << 1) | r.user, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
                 let part = (((o.user >> 32) * q as u64) >> 32) as usize;
                 if DIAG && abl == 7 { abl_sink += o.user; continue; }
                 wc2.push(e2, pool, part, o);
@@ -2226,10 +2172,8 @@ unsafe fn s2_part(slices: &[(*mut Rec, usize)], bufs: &mut S2Buf, lm: &LinkMap, 
             if r.ts >= 0x8000_0000 {
                 continue;
             }
-            let mut o = Rec2 { user: r.user, pos: ((r.pp >> 24) & LINEMASK) << 1, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
-            if EMAP && r.pp & PP_MAPPED != 0 {
-                o.pos |= (r.pp >> 62) & 1;
-            } else if has_links {
+            let mut o = Rec2 { user: r.user, pos: (r.pp >> 24) << 1, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
+            if has_links {
                 let (pu, linked) = lm.map(r.user);
                 o.user = pu;
                 o.pos |= linked as u64;
@@ -4120,12 +4064,6 @@ fn main() {
                 let mut wcc2: Wc<RecC, 8> = Wc::new(q);
                 let mut cring = [RecC { user: 0, pc: 0, ts: 0, kh: 0 }; CRING];
                 let mut crn = 0usize;
-                let mut ering = [Rec { user: 0, pp: 0, eh: 0, ts: 0, ic: 0 }; ERING];
-                let mut eringb = [0u64; ERING];
-                let mut ern = 0usize;
-                let mut elm: Option<&LinkMap> = None;
-                // whether the link files hold any link (known once they are parsed, before any event chunk)
-                let has_links1 = lraw.iter().any(|v| !v.get().is_empty());
                 let mut lm1: Option<&LinkMap> = None;
                 // SS_REPEAT=n (single thread, parse benchmark): run the chunk loop n times, report each
                 let mut rep_left = repeat;
@@ -4225,13 +4163,10 @@ fn main() {
                             };
                         }
                         if EVFN && !SCANNL && !DIAG {
-                            if EMAP && elm.is_none() && has_links1 && links_ready.load(std::sync::atomic::Ordering::Acquire) {
-                                elm = Some(&*linkmap.get());
-                            }
                             if strict {
-                                ev_lines::<true>(&evcx, &mut wc1, evb, s, c.b, c.fe, elm, &mut ering, &mut eringb, &mut ern);
+                                ev_lines::<true>(&evcx, &mut wc1, evb, s, c.b, c.fe);
                             } else {
-                                ev_lines::<false>(&evcx, &mut wc1, evb, s, c.b, c.fe, elm, &mut ering, &mut eringb, &mut ern);
+                                ev_lines::<false>(&evcx, &mut wc1, evb, s, c.b, c.fe);
                             }
                             s = c.b;
                         }
@@ -4461,14 +4396,6 @@ fn main() {
                             ck_body!(p, line, r, fs);
                         }
                         }
-                    }
-                }
-                if let Some(l) = elm {
-                    for k in ern.saturating_sub(ERING)..ern {
-                        let mut d = ering[k & (ERING - 1)];
-                        emap(l, &mut d, eringb[k & (ERING - 1)]);
-                        let dpart = (((d.eh >> 32) * p1 as u64) >> 32) as usize;
-                        wc1.push(evb, dpart, d);
                     }
                 }
                 wc1.finish(evb);
@@ -4720,11 +4647,6 @@ fn main() {
                                         lm.prefetch(recs.get_unchecked(i + PF2).user);
                                     }
                                     let r = recs.get_unchecked_mut(i);
-                                    if EMAP && r.pp & PP_MAPPED != 0 {
-                                        r.eh = r.user;
-                                        r.user = (r.pp >> 62) & 1;
-                                        continue;
-                                    }
                                     let (pu, linked) = lm.map(r.user);
                                     r.eh = pu;
                                     r.user = linked as u64;
@@ -4741,7 +4663,7 @@ fn main() {
                                     if r.ts >= 0x8000_0000 {
                                         continue;
                                     }
-                                    let o = Rec2 { user: r.eh, pos: (((r.pp >> 24) & LINEMASK) << 1) | r.user, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
+                                    let o = Rec2 { user: r.eh, pos: ((r.pp >> 24) << 1) | r.user, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
                                     let part = (((o.user >> 32) * q as u64) >> 32) as usize;
                                     if DIAG && abl == 7 { abl_sink += o.user; continue; }
                                     wc2.push(e2, &mut pool, part, o);
@@ -4761,10 +4683,8 @@ fn main() {
                                 if r.ts >= 0x8000_0000 {
                                     continue;
                                 }
-                                let mut o = Rec2 { user: r.user, pos: ((r.pp >> 24) & LINEMASK) << 1, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
-                                if EMAP && r.pp & PP_MAPPED != 0 {
-                                    o.pos |= (r.pp >> 62) & 1;
-                                } else if has_links {
+                                let mut o = Rec2 { user: r.user, pos: (r.pp >> 24) << 1, ts: r.ts, pc: (((r.pp & 0xFF_FFFF) as u32) << 8) | (r.ic & 0xFF) };
+                                if has_links {
                                     let (pu, linked) = lm.map(r.user);
                                     o.user = pu;
                                     o.pos |= linked as u64;
